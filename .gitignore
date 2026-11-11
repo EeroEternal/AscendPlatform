@@ -1,0 +1,18 @@
+# Byte-compiled / cache artefacts
+__pycache__/
+*.py[cod]
+
+# Build / packaging artefacts (root-anchored: an unanchored "build/" or "runtime/" would also
+# match src/ascend_platform/runtime/ — that silently dropped a whole layer once)
+/build/
+/dist/
+*.egg-info/
+*.whl
+
+# Test / tool caches
+.pytest_cache/
+.venv*/
+*.log
+
+# Throwaway directories the test-suite creates inside the workspace (the sandbox denies /tmp)
+/runtime/

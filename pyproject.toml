@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ascend-platform"
+description = "Ascend platform plugin for vLLM: device and execution semantics, not operator math"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "AscendPlatform contributors" }]
+keywords = ["ascend", "npu", "vllm", "platform", "inference"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Intended Audience :: Developers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version"]
+
+# The platform itself needs only torch: device probing, page geometry and the plan cache are host
+# side.  The engine and the NPU are optional extras, because the contract is "no operator layer, no
+# NPU, still importable and still able to explain what is missing".
+dependencies = ["torch>=2.0"]
+
+[project.optional-dependencies]
+npu = ["torch_npu"]
+# Pinned to the 0.23 line: engine/platform.py and engine/attention/backend.py are written against
+# vLLM 0.23's Platform ABC and v1 attention API (docs/versioning.md).
+vllm = ["vllm>=0.23,<0.24"]
+dev = ["pytest>=7", "pytest-timeout"]
+
+[project.scripts]
+# Prints the bring-up checklist as PASS/FAIL/SKIP with the fix hint; exits non-zero on a hard
+# failure.  Imports nothing engine-side until a check needs it.
+ascend-platform = "ascend_platform.doctor.cli:main"
+
+[project.entry-points."vllm.platform_plugins"]
+ascend_platform = "ascend_platform.engine.platform:register"
+
+[project.entry-points."vllm.general_plugins"]
+ascend_platform = "ascend_platform.engine.plugin:install"
+
+[project.urls]
+Homepage = "https://github.com/EeroEternal/AscendPlatform"
+
+[tool.setuptools.dynamic]
+version = { attr = "ascend_platform._version.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ascend_platform*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# So `python -m pytest tests/test_one_file.py` works from a clean checkout, without installing the
+# package and without remembering `PYTHONPATH=src`.  Deliverable 3 is "per-file green on CPU", and a
+# command that only works when the environment is set up from memory is not a reproducible command.
+pythonpath = ["src", "."]
+addopts = "-q"
+markers = [
+  "npu: test requires an Ascend NPU",
+  "vllm: test requires an installed vLLM",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
