@@ -533,7 +533,14 @@ def _install_ops() -> Dict[str, Any]:
     try:
         from ascend_platform.ops.install import install_ops
 
-        report = install_ops(engine_factories=_engine_factories())
+        from ascend_platform.engine.abi import vllm_0_23
+
+        report = install_ops(
+            engine_factories=_engine_factories(),
+            # The vLLM 0.23 symbol table: the engine layer is the authority on what this release
+            # ships, so the family table's own targets are checked against it at plan time.
+            engine_symbols=vllm_0_23.ENGINE_SYMBOL,
+        )
     except Exception as exc:  # noqa: BLE001 - a general plugin must not raise
         info["detail"] = f"install_ops() raised {exc!r}; vLLM's own operators are still in place"
         logger.warning("ascend-platform ops: %s", info["detail"])

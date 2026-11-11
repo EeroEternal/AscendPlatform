@@ -156,6 +156,10 @@ class OpBinding:
     #: one at a time, so a module that is missing from the operator layer is a fact about *this* op
     #: and must not take the other twelve with it (that was the 8-of-13-exist-and-0-bind failure).
     impl_note: str = ""
+    #: The semantic name this record realises (``contracts/vocabulary.py``).  It is what the engine
+    #: ABI table is keyed by, so the record can be checked against ``engine/abi`` at plan time
+    #: instead of carrying an engine path that nothing verifies.
+    platform_name: str = ""
     #: The per-op candidate seam (``ascend_platform.ops.candidates``) when the family registers one:
     #: ``impl`` stays the **baseline** implementation, so every report, doctor line and test that
     #: names the implementation keeps naming it; what gets bound is ``candidates.dispatched()``.
@@ -637,9 +641,14 @@ def _plan(binding: OpBinding, report: OpsReport, registered: List[str]) -> str:
         )
         return "unbound"
 
+    targets, drift = _targets_of(binding)
+    if drift:
+        report.details[binding.op] = f"unbound: {drift}; fix one side, not both"
+        return "unbound"
+
     primary: Optional[str] = None
     tried: List[str] = []
-    for target in binding.targets:
+    for target in targets:
         ok, reason = _resolvable(target)
         if ok:
             primary = target
@@ -717,7 +726,47 @@ def _resolve_families(report: "OpsReport") -> List[Tuple[str, str, Sequence[Any]
         return []
 
 
-def install_ops(engine_factories: Optional[Mapping[str, Callable[[type], type]]] = None) -> OpsReport:
+#: The engine's symbol table, published by the engine layer (``engine/abi/vllm_0_23.py``).  When it
+#: is present it is **authoritative**: a record's own ``targets`` are a legacy fallback and a
+#: disagreement between the two is reported rather than quietly resolved in one direction.
+_ENGINE_SYMBOLS: Dict[str, str] = {}
+
+
+def set_engine_symbols(symbols: Optional[Mapping[str, str]]) -> None:
+    """Publish (or clear, with ``None``) the semantic-name -> engine-path table."""
+    _ENGINE_SYMBOLS.clear()
+    if symbols:
+        _ENGINE_SYMBOLS.update(symbols)
+
+
+def engine_symbols() -> Dict[str, str]:
+    """A copy of the published table; empty when the engine layer did not publish one."""
+    return dict(_ENGINE_SYMBOLS)
+
+
+def _targets_of(binding: "OpBinding") -> Tuple[Tuple[str, ...], str]:
+    """The targets to try for one record, and a drift sentence when the two sources disagree.
+
+    ``engine/abi`` is the authority on what vLLM 0.23 ships; the record's own ``targets`` predate
+    that layer.  Both existing is normal during the move, so the check is an *equality* check, not a
+    replacement: a disagreement means one of the two was edited alone, which is exactly the class of
+    drift that makes "bound" mean the wrong thing.
+    """
+    published = _ENGINE_SYMBOLS.get(getattr(binding, "platform_name", "") or "")
+    if published is None or not binding.targets:
+        return binding.targets, ""
+    if published != binding.targets[0]:
+        return binding.targets, (
+            f"engine ABI drift: engine/abi says {published!r} for {binding.platform_name!r}, "
+            f"the binding table says {binding.targets[0]!r}"
+        )
+    return (published,) + tuple(binding.targets[1:]), ""
+
+
+def install_ops(
+    engine_factories: Optional[Mapping[str, Callable[[type], type]]] = None,
+    engine_symbols: Optional[Mapping[str, str]] = None,
+) -> OpsReport:
     """Wire every family the active model profile names into vLLM's dispatch; never raises.
 
     ``engine_factories`` is how the **engine layer** publishes an implementation whose shape is
@@ -727,12 +776,19 @@ def install_ops(engine_factories: Optional[Mapping[str, Callable[[type], type]]]
     names from ``contracts/vocabulary.py`` (today: ``engine.moe_method``); the plugin passes
     ``{"engine.moe_method": vllm_0_23.moe_method_factory(compute)}``.
 
+    ``engine_symbols`` is the same seam for *paths*: ``engine/abi/vllm_0_23.ENGINE_SYMBOL`` maps a
+    record's ``platform_name`` to what this vLLM release ships.  When published it is authoritative,
+    and a record whose own ``targets`` disagree with it is reported as drift instead of binding
+    whichever one happened to be read first.
+
     Idempotent: the second call in a process returns the first call's report unchanged.  The
     install is *planned* against the live module tree before anything is applied, so a vLLM point
     release that moved a symbol shows up as an ``unbound`` line naming the exact target.
     """
     if engine_factories:
         families_module.set_engine_factories(engine_factories)
+    if engine_symbols is not None:
+        set_engine_symbols(engine_symbols)
     with _LOCK:
         cached = _STATE.get("report")
         if _STATE.get("installed") and isinstance(cached, OpsReport):

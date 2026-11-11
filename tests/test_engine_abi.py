@@ -48,31 +48,53 @@ def test_every_declared_name_is_classified_exactly_once():
     )
 
 
+def test_every_record_declares_a_semantic_name_from_the_vocabulary():
+    unknown = [b.op for b in gdn_moe.bind() if b.platform_name not in BY_NAME]
+    assert not unknown, (
+        "these records carry no (or an undeclared) platform_name, so nothing ties them to the "
+        f"engine ABI table: {unknown}"
+    )
+
+
 def test_the_paths_match_what_the_family_table_binds_today():
-    """The table is a *view* of the binding, so a drift between them is caught here first."""
-    engine_name_of = {
-        "topk_softmax": "moe.routing_topk_softmax",
-        "moe_align_block_size": "moe.align_block_size",
-        "silu_and_mul": "moe.swiglu_gate",
-        "fused_experts": "moe.experts",
-        "chunk_gated_delta_rule": "gdn.chunk_gated_delta_rule",
-        "chunk_local_cumsum": "gdn.chunk_local_cumsum",
-        "l2norm_fwd": "gdn.l2norm",
-        "fused_sigmoid_gating_delta_rule_update": "gdn.fused_sigmoid_gating",
-        "fused_recurrent_gated_delta_rule_packed_decode": "gdn.recurrent_decode",
-        "fused_post_conv_prep": "gdn.post_conv_prep",
-        "causal_conv1d_fn": "gdn.conv1d_prefill",
-        "causal_conv1d_update": "gdn.conv1d_update",
-    }
-    mismatches = []
+    """The ABI table is the authority; the record's ``targets`` must agree with it, not drift."""
+    mismatches, unchecked = [], []
     for record in gdn_moe.bind():
-        semantic = engine_name_of.get(record.op)
-        if semantic is None:
+        published = abi.ENGINE_SYMBOL.get(record.platform_name)
+        if published is None:
+            unchecked.append(record.platform_name)
             continue
-        bound = record.targets[0]
-        if abi.ENGINE_SYMBOL[semantic] != bound:
-            mismatches.append(f"{record.op}: abi={abi.ENGINE_SYMBOL[semantic]!r} table={bound!r}")
+        if published != record.targets[0]:
+            mismatches.append(
+                f"{record.op}: abi={published!r} binding={record.targets[0]!r}"
+            )
     assert not mismatches, mismatches
+    assert unchecked == ["engine.moe_method"], (
+        "exactly one record is a class-factory slot with no engine symbol; a different set means "
+        f"the table or the records moved: {unchecked}"
+    )
+
+
+def test_a_published_symbol_table_is_authoritative_and_a_disagreement_is_drift():
+    """Two sources exist during the move; they must agree, and the engine's table wins."""
+    from ascend_platform.ops import install as install_mod
+
+    record = next(b for b in gdn_moe.bind() if b.op == "topk_softmax")
+    wanted = record.platform_name
+
+    # Publishing the *correct* path changes nothing: it is the same string the record carries.
+    try:
+        install_mod.set_engine_symbols({wanted: record.targets[0]})
+        assert install_mod._targets_of(record) == (record.targets, "")
+
+        # Publishing a different path is reported as drift, and the record is not bound.
+        install_mod.set_engine_symbols({wanted: "vllm._custom_ops.moved_elsewhere"})
+        targets, drift = install_mod._targets_of(record)
+        assert targets == record.targets and "engine ABI drift" in drift
+        assert wanted in drift and "moved_elsewhere" in drift
+    finally:
+        install_mod.set_engine_symbols(None)
+    assert install_mod.engine_symbols() == {}
 
 
 def test_an_unknown_name_says_which_side_to_fix():

@@ -375,6 +375,7 @@ def bind() -> List[Any]:
     records = [
         OpBinding(
             op="chunk_gated_delta_rule",
+            platform_name="gdn.chunk_gated_delta_rule",
             family="gdn",
             targets=(f"{_GDN}.ChunkGatedDeltaRule",),
             kind="custom_op",
@@ -398,6 +399,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="l2norm_fwd",
+            platform_name="gdn.l2norm",
             family="gdn",
             targets=(f"{_FLA}.l2norm.l2norm_fwd",),
             aliases=(f"{_FLA}.chunk.l2norm_fwd", f"{_GDN}.l2norm_fwd"),
@@ -414,6 +416,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="causal_conv1d_fn",
+            platform_name="gdn.conv1d_prefill",
             family="gdn",
             targets=(f"{_MAMBA}.causal_conv1d.causal_conv1d_fn",),
             aliases=(f"{_GDN}.causal_conv1d_fn",),
@@ -431,6 +434,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="causal_conv1d_update",
+            platform_name="gdn.conv1d_update",
             family="gdn",
             targets=(f"{_MAMBA}.causal_conv1d.causal_conv1d_update",),
             aliases=(f"{_GDN}.causal_conv1d_update",),
@@ -447,6 +451,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="fused_sigmoid_gating_delta_rule_update",
+            platform_name="gdn.fused_sigmoid_gating",
             family="gdn",
             targets=(f"{_FLA}.fused_sigmoid_gating.fused_sigmoid_gating_delta_rule_update",),
             aliases=(f"{_GDN}.fused_sigmoid_gating_delta_rule_update",),
@@ -463,6 +468,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="fused_recurrent_gated_delta_rule_packed_decode",
+            platform_name="gdn.recurrent_decode",
             family="gdn",
             targets=(
                 f"{_FLA}.fused_recurrent.fused_recurrent_gated_delta_rule_packed_decode",
@@ -482,6 +488,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="chunk_local_cumsum",
+            platform_name="gdn.chunk_local_cumsum",
             family="gdn",
             targets=(f"{_FLA}.cumsum.chunk_local_cumsum",),
             aliases=(f"{_GDN}.chunk_local_cumsum",),
@@ -503,6 +510,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="fused_post_conv_prep",
+            platform_name="gdn.post_conv_prep",
             family="gdn",
             targets=(f"{_FLA}.fused_gdn_prefill_post_conv.fused_post_conv_prep",),
             aliases=(f"{_GDN}.fused_post_conv_prep",),
@@ -532,6 +540,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="topk_softmax",
+            platform_name="moe.routing_topk_softmax",
             family="moe",
             targets=("vllm._custom_ops.topk_softmax",),
             impl=moe_topk[0],
@@ -554,6 +563,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="moe_align_block_size",
+            platform_name="moe.align_block_size",
             family="moe",
             targets=("vllm._custom_ops.moe_align_block_size",),
             impl=moe_align[0],
@@ -579,6 +589,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="fused_experts",
+            platform_name="moe.experts",
             family="moe",
             targets=("vllm.model_executor.layers.fused_moe.fused_moe.fused_experts",),
             impl=moe_experts[0],
@@ -618,6 +629,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="unquantized_fused_moe",
+            platform_name="engine.moe_method",
             family="moe",
             kind="custom_op_oot",
             targets=(
@@ -661,6 +673,7 @@ def bind() -> List[Any]:
         ),
         OpBinding(
             op="silu_and_mul",
+            platform_name="moe.swiglu_gate",
             family="dense",
             targets=(
                 "vllm._custom_ops.silu_and_mul",

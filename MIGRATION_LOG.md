@@ -480,6 +480,11 @@ vLLM 0.23.0 | strict=False | patches: 3 applied, 0 skipped (target gone), 0 fail
 | 逐项绑定 + provider 发现 | 10 bound / 2 unbound / 1 off |
 | 再加 `engine/abi`（符号表 + MoE 类工厂） | **11 bound / 1 unbound / 1 off** |
 
+再往后一步：**符号表也由引擎层发布**（`install_ops(engine_symbols=...)`，插件传
+`engine/abi/vllm_0_23.ENGINE_SYMBOL`）。发布后它是权威——每个绑定记录带 `platform_name`（语义名），
+两边路径不一致就报 "engine ABI drift" 并拒绝绑定，而不是"谁先读到算谁"。这样"引擎知识只在 ABI 层"
+变成了运行时检查，不只是文档里的主张。
+
 最后剩下的那 1 个 unbound 是 `chunk_local_cumsum`——我们**刻意** decline（FLA 的签名不是 drop-in），
 它带的是自己的理由而不是"模块缺失"。`silu_and_mul` 只是 `dense` 族默认关闭。
 
