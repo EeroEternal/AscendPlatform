@@ -141,3 +141,42 @@ model loaded 23.4s、生成正确、OK 29.1s；结论"阻塞不在本仓，缺�
 
 两张表本仓都已在 `d43fe09` 落地（`engine/abi/vllm_0_23.py::INPLACE_ENGINE_SYMBOL` +
 `inplace_adapters()`），并有用真实 `vllm._custom_ops` 属性、按 vLLM 调用协议跑的验证。
+
+## 7. 本仓复跑（2026-11-11 14:24–14:43，NPU 空闲后）
+
+`VLLM_ENABLE_V1_MULTIPROCESSING=0 VLLM_PLUGINS=ascend_platform ASCEND_PLATFORM_OPS=ascend_attention`，
+`LLM(model=/home/models/Qwen3.6-35B-A3B, max_model_len=2048, gpu_memory_utilization=0.85,
+enforce_eager=True)`，两个提示、`temperature=0`、`max_tokens=16`、`logprobs=5`。
+
+**结果：跑通，不需要算子侧的 5 行临时适配器**（`d43fe09` 之后本仓已带适配器）：
+
+```
+RESULT model_loaded_s=976.1 generate_s=140.0
+PROMPT 'The capital of France is' -> ' Paris, a city renowned for its rich history and cultural
+heritage. Paris is the'
+PROMPT '1+1=' -> '2 是公理吗？…'
+OK
+```
+
+链路上确认走的是两条本仓路径 + 算子仓：`registered AscendUnquantizedFusedMoEMethod as the out-of-tree
+UnquantizedFusedMoEMethod`、`OOT MoE: using 'ascend_attention.ops.moe.compute' for the routed experts`、
+`ops: 11 bound, 1 unbound (chunk_local_cumsum, declined), 1 off by switch | dense=off gdn=on moe=on`、
+`profile=qwen3.6 hybrid=True block_size=2048`。与算子侧独立跑出的文本前缀一致
+（`' Paris, a city renowned for its rich…'`），说明不是偶发。
+
+**首次尝试失败过，失败与平台无关但值得记**：默认 V1 多进程（fork）下 torch_npu 直接拒绝初始化 ——
+`RuntimeError: Cannot re-initialize NPU in forked subprocess. To use NPU with multiprocessing, you
+must use the 'spawn' start method`。必须 `VLLM_ENABLE_V1_MULTIPROCESSING=0`（或
+`VLLM_WORKER_MULTIPROC_METHOD=spawn`），本仓 [`docs/hardware-checklist.md`](../hardware-checklist.md) §0
+早就写了这两个变量——是我没先读自己的检查单，不是新问题。
+
+`model_loaded_s=976` 里绝大部分是 tilelang decode kernel 的分桶 JIT 编译（每个 bucket 约 105 s，
+1/2/4/8/16/32/64/128/256 共 9 个），缓存目录 `tl_cache*` 命中后会显著下降；`generate_s=140` 是两条
+提示的 prefill+decode（含 prefill kernel 首次编译）。这两项都随缓存状态变化，不能当性能基线。
+
+### 回归基线（`temperature=0`，`logprobs=5`，本机复跑时记录）
+
+| 提示 | 首 token | 前 5 个 logprob（token_id: logprob） |
+|---|---|---|
+| `The capital of France is` | ` Paris` | 11751: -0.569381, 264: -2.194381, 279: -3.006881, 3750: -3.631881, 271: -3.694381 |
+| `1+1=` | `2` | 17: -0.806895, 18: -1.306895, 16: -2.244395, 15: -3.744395, 10992: -3.556895 |
