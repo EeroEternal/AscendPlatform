@@ -28,6 +28,7 @@
 | `TILEINFER_SPLIT_KV_PAGES` | `0`（关） | `engine/attention/impl.py` | split-KV 的页数；非 0 才启用。**注意它是策略选择，不是安全性**——编译病理见 `hardware-facts.md` |
 | `TILEINFER_ACLGRAPH` | 关 | `engine/platform.py` | `1` 请求 decode 图捕获（前提是 `graphs.capture_path_ready()` 为真，否则只告警） |
 | `TILEINFER_COMPILE` | `1`（开） | `engine/platform.py` | `0` 关 torch.compile 但保留图捕获 |
+| `TILEINFER_DEBUG_NAN` | 关 | `engine/attention/impl.py` | `1` 时检查 attention 的 q/k/v 与输出是否含 NaN/Inf（每处一次同步，只在定位数值 blow-up 时开） |
 | `TILEINFER_ATTN_STEP_SHARE` | 关 | `engine/attention/impl.py` | 跨层共享同一步的注意力规划（省一次规划，不改语义） |
 | `TILEINFER_DYNAMO_OPAQUE` | `1`（开） | `engine/attention/impl.py` | `0` 时让 dynamo 穿透算子调用（调试编译问题用；穿透后图会变碎） |
 | `TILEINFER_VLLM_STRICT` | 关 | `engine/plugin.py` | `1` 时把补丁安装失败当启动失败（默认只告警：一个点版本的补丁失配不该让服务起不来） |

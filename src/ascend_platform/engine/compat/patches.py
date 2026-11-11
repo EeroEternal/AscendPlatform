@@ -285,6 +285,49 @@ def _apply_phase_probes_on_load() -> None:
     GPUModelRunner.load_model = load_model
 
 
+def _install_nan_trace_on_load() -> None:
+    """``TILEINFER_DEBUG_NAN=1``: hook the decoder layers once the weights exist.
+
+    Wraps the *already patched* ``load_model`` (registered after the phase probes) so the trace can
+    see the model object; the two patches stay independent, and this one is a no-op unless the
+    variable is set.
+    """
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # noqa: PLC0415
+
+    from ascend_platform.engine import debug_nan  # noqa: PLC0415
+
+    if not debug_nan.enabled():
+        return
+    original = getattr(GPUModelRunner.load_model, "__tileinfer_original__", GPUModelRunner.load_model)
+
+    def load_model(self, *args, **kwargs):  # noqa: ANN001
+        result = original(self, *args, **kwargs)
+        try:
+            model = getattr(self, "model", None)
+            if model is not None:
+                debug_nan.install_on(model)
+        except Exception:  # noqa: BLE001 - a diagnostic must never break a run
+            debug_nan.logger.warning("ascend-platform nan-trace could not hook the model", exc_info=True)
+        return result
+
+    load_model.__tileinfer_original__ = original  # type: ignore[attr-defined]
+    GPUModelRunner.load_model = load_model
+
+
+register(
+    Patch(
+        target="vllm.v1.worker.gpu_model_runner.GPUModelRunner",
+        why="locate the module that first turns a finite hidden state into NaN/Inf: the Qwen3.6 "
+        "long-generation collapse is one NaN decode step, and the attention probe showed the NaN "
+        "already present in q/k/v, so the introducer is upstream of attention",
+        apply=_install_nan_trace_on_load,
+        since="diagnostic only",
+        remove_when="the introducer is fixed and a regression test covers it",
+        upstream_ref="vllm/v1/worker/gpu_model_runner.py",
+    )
+)
+
+
 register(
     Patch(
         target="vllm.v1.worker.gpu_model_runner.GPUModelRunner.load_model",

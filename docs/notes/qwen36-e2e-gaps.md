@@ -251,3 +251,52 @@ MISMATCH 17/256，全部落在 11–31（近 tie 区），k>31 之后两条路�
 差别不在 decode（两者 decode 都约 10.5 tok/s），而在 **GDN prefill 每次换序列长度都重新编译**
 （连续两次 prefill 分别 129.7 s / 112.9 s，而 TileInfer 侧同一 prefill 0.8 s）。这不是正确性 bug，
 是算子侧 JIT 缓存键/`TILELANG_CACHE_DIR` 没接上的问题。
+
+## 9. NaN 定位链（2026-11-11 17:0x–17:35）：在平台的 decode attention 输出里
+
+三个工具、四轮实验，逐层把责任范围收窄。全部在 `TILEINFER_DEBUG_NAN=1` 下可复现
+（关闭时零开销、零同步）。
+
+| 实验 | 结论 |
+|---|---|
+| attention impl 里查 `q`/`k`/`v`/输出 | 某一步 `q` 已经全 NaN（4096/4096）⇒ NaN 来自 attention **上游** |
+| 换算子层（TileInfer / AscendAttention） | 同样崩 ⇒ 不是算子库 |
+| `TILEINFER_OPS=moe`（GDN 换回 vLLM 自己的 FLA） | 同样崩 ⇒ 不是 GDN / MoE 的算子数学 |
+| `load_model` 后给 40 个 decoder layer + 子模块挂 NaN 钩子，报"第一个把有限输入变成坏的模块" | `layers.3.self_attn.attn`（vLLM `Attention` 模块，其 forward 直接进本平台 `TileInferAttentionImpl`），输入有限 |
+| 在 kernel 调用前把 `out_buf` 填 `+inf` 当哨兵 | 跑完 **没有一个 +inf 残留**，而 heads 0、6 是 NaN ⇒ 不是"没写"，是 kernel **算出来**的 |
+
+精确指纹（可复现，两次运行一致）：
+
+```
+seq_lens=50  num_tokens=1  num_reqs=1  dtype=bf16
+decode.out : nan=512  heads=[0, 6]  head_rows=[256, 256]      # 2 个 head 的 256 维全 NaN
+下一层 q   : nan=4096 heads=全部 16 个                         # 残差已被污染
+```
+
+要点：
+
+* `layers.3` 是**第一个 full_attention 层**（`layer_types[:4]` = linear, linear, linear, full），
+  `attn_output_gate=true`，16 个 q head / 2 个 kv head。heads 0 与 6 同属**第一个 KV 组
+  （0–7）**，所以怀疑点集中在 q-head 分块（`block_h`）或该 KV 组的读页索引，而不是整行/整页。
+* 不是未初始化内存：哨兵实验把 `out_buf` 填成 `+inf`，如果 kernel 漏写某个 head，那里会留 `+inf`；
+  实测残留 0 个 `+inf`、512 个 NaN，说明每个 head 都被写过，NaN 是算出来的。
+* 不是 page 边界/长度：`seq_lens=50` 落在单个 128 子页内，`kv_last_page_len=50`，同一形状在
+  `seq_lens<50` 的步上是好的；崩在**第 14 个 decode 步**（绝对位置 50），且 `layers.3` 每步都被调用，
+  说明触发条件与页内偏移或该步的某个 value 有关（待定）。
+
+复现命令（本机）：
+
+```bash
+TILEINFER_DEBUG_NAN=1 VLLM_PLUGINS=ascend_platform ASCEND_PLATFORM_OPS=ascend_attention \
+PYTHONPATH=/home/userlist/zxs/AscendAttention/src \
+  .venv/bin/python tools/diag_longgen.py --model /home/models/Qwen3.6-35B-A3B --max-new 32
+```
+
+下一步（按顺序）：
+
+1. 用同一形状写一个 kernel 级最小复现：q `[1,16,256]`、单 block、`seq_lens=50`、`pool_cap=8192`、
+   `k_pool` 由 `sub_pages(2048)` 视图给出；把 49 个历史 token 的 k/v 用已知有限值填满，看 heads 0/6
+   是否仍 NaN。填 0 也 NaN ⇒ 纯算术；填 0 变好 ⇒ 读到了页内未写区（历史 token 的 k/v 写错位）。
+2. 若确认是读错位：查 `write_kv_cache` 的 slot 计算与 `pool_sub_view` 的 stride 在
+   `attn_output_gate=True` + GQA(16/2) 下的自洽性（这两个是本仓代码）。
+3. 若确认是纯算术：查 kernel plan 的 `block_h` 与 `num_qo_heads=16` 的分块余数路径（tilelang）。

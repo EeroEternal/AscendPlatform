@@ -2227,3 +2227,64 @@ def test_the_flag_cannot_select_a_platform_without_a_device(monkeypatch):
     monkeypatch.setattr(platform_mod, "_npu_available", lambda: False)
     monkeypatch.setenv("VLLM_DSV41", "1")
     assert register() is None
+
+
+def test_the_nan_probe_is_silent_unless_asked(monkeypatch, caplog):
+    """A diagnostic that always syncs is a performance bug; one that never fires is useless."""
+    import torch
+
+    from ascend_platform.engine.attention import impl as impl_mod
+
+    nan = torch.full((2, 4), float("nan"))
+    monkeypatch.delenv("TILEINFER_DEBUG_NAN", raising=False)
+    impl_mod._NAN_SITES.clear()
+    impl_mod._check_finite(nan, "q", None)
+    assert impl_mod._NAN_SITES == {}, "off by default: no sync, no report"
+
+    monkeypatch.setenv("TILEINFER_DEBUG_NAN", "1")
+    with caplog.at_level("WARNING", logger="ascend_platform.engine.attention.impl"):
+        impl_mod._check_finite(nan, "q", None)
+    assert impl_mod._NAN_SITES["q"] == 1
+    assert any("NaN/Inf at q" in record.getMessage() for record in caplog.records)
+
+    impl_mod._check_finite(torch.ones(2, 4), "q", None)  # finite: counted, not reported
+    assert impl_mod._NAN_SITES["q"] == 1
+
+
+def test_the_nan_trace_names_the_module_that_introduces_nan(monkeypatch, caplog):
+    """The whole point: the *introducer*, not "everything from layer 7 on"."""
+    import torch
+    import torch.nn as nn
+
+    from ascend_platform.engine import debug_nan
+
+    class Poison(nn.Module):
+        def forward(self, x):
+            return x * float("nan")
+
+    class Toy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(4, 4), Poison(), nn.Linear(4, 4)])
+
+        def forward(self, x):
+            for layer in self.layers:
+                x = layer(x)
+            return x
+
+    monkeypatch.setenv("TILEINFER_DEBUG_NAN", "1")
+    debug_nan._REPORTS.clear()
+    model = Toy()
+    assert debug_nan.install_on(model) == 3, "every decoder layer is instrumented"
+    with caplog.at_level("ERROR", logger="ascend_platform.engine.debug_nan"):
+        model(torch.ones(2, 4))
+    assert debug_nan.reported() == ("layers.1",)
+    assert any("layers.1 wrote NaN/Inf into its return value" in record.getMessage() for record in caplog.records)
+
+
+def test_the_nan_trace_is_off_unless_asked(monkeypatch):
+    from ascend_platform.engine import debug_nan
+
+    monkeypatch.delenv("TILEINFER_DEBUG_NAN", raising=False)
+    assert debug_nan.enabled() is False
+    assert debug_nan.install(object()) is None, "no hooking, no cost, on a normal run"

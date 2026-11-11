@@ -210,6 +210,72 @@ def reset_runtime_state() -> None:
         _SHARED_STEPS.clear()
 
 
+def _debug_nan_enabled() -> bool:
+    """``TILEINFER_DEBUG_NAN=1``: check attention inputs and outputs for NaN/Inf.
+
+    Off by default because every check is a device sync.  It exists because "the model's long
+    generation degrades" and "one decode step returned NaN logits" look identical in the generated
+    text, and the difference decides whose bug it is: NaN already in ``q``/``k``/``v`` is upstream of
+    attention (the layer that produced them), NaN only in the output is this kernel.
+    """
+    raw = os.environ.get("TILEINFER_DEBUG_NAN", "").strip().lower()
+    return raw not in ("", "0", "false", "no")
+
+
+#: label -> how many times that site has been reported (so a broken step does not flood the log).
+_NAN_SITES: Dict[str, int] = {}
+
+
+def _check_finite(tensor: Optional[torch.Tensor], label: str, meta: object = None) -> None:
+    """Report the first few NaN/Inf sightings at one site, with enough context to place them.
+
+    Silent (and sync-free) unless :func:`_debug_nan_enabled`.  Never raises: a diagnostic that can
+    itself break a run is worse than no diagnostic.
+    """
+    if tensor is None or not _debug_nan_enabled():
+        return
+    try:
+        nans = int(torch.isnan(tensor).sum().item())
+        infs = int(torch.isinf(tensor).sum().item())
+    except Exception:  # noqa: BLE001 - integer dtypes cannot hold NaN; a bad tensor must not crash
+        return
+    if not nans and not infs:
+        return
+    seen = _NAN_SITES.get(label, 0) + 1
+    _NAN_SITES[label] = seen
+    if seen > 3:
+        return
+    detail = {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "nan": nans,
+        "inf": infs,
+    }
+    try:
+        bad = torch.isnan(tensor) | torch.isinf(tensor)
+        if tensor.dim() == 3:
+            # Which heads are hit is the difference between "the whole row is garbage" (state /
+            # masking) and "one GQA group is wrong" (indexing).
+            per_head = bad.sum(dim=(0, 2)).tolist()
+            detail["heads"] = [i for i, count in enumerate(per_head) if count]
+            detail["head_rows"] = [int(count) for count in per_head if count]
+        flat = torch.nonzero(bad.flatten())[:6].flatten().tolist()
+        detail["first_idx"] = flat
+    except Exception:  # noqa: BLE001 - detail must never break the report
+        pass
+    for attr in ("num_actual_tokens", "num_reqs", "is_prefill"):
+        if hasattr(meta, attr):
+            detail[attr] = getattr(meta, attr)
+    seq_lens = getattr(meta, "seq_lens", None)
+    if seq_lens is not None:
+        try:
+            detail["seq_lens_max"] = int(seq_lens.max().item())
+            detail["seq_lens_min"] = int(seq_lens.min().item())
+        except Exception:  # noqa: BLE001
+            pass
+    log = logger.error if seen == 1 else logger.warning
+    log("ascend-platform attention NaN/Inf at %s (sighting %d): %s", label, seen, detail)
+
 def _step_share_enabled() -> bool:
     """Whether the batch's ragged triple is computed once per step instead of once per layer.
 
@@ -582,6 +648,9 @@ class TileInferAttentionImpl(AttentionImpl):
         q3 = self._as_3d(query, num_tokens, self.num_heads, "query")
         k3 = self._as_3d(key, num_tokens, self.num_kv_heads, "key")
         v3 = self._as_3d(value, num_tokens, self.num_kv_heads, "value")
+        _check_finite(q3, "q", meta)
+        _check_finite(k3, "k", meta)
+        _check_finite(v3, "v", meta)
         write_kv_cache(k3, v3, k_half, v_half, meta.slot_mapping)
         IMPL_COUNTERS.bump("kv_writes")
 
@@ -633,10 +702,13 @@ class TileInferAttentionImpl(AttentionImpl):
             else:
                 IMPL_COUNTERS.bump("prefill_kernel")
                 self._log_prefill_share()
+                _check_finite(result, "prefill.out", meta)
                 return result
         IMPL_COUNTERS.bump("prefill_reference")
         self._log_prefill_share()
-        return self._reference_forward(q3, k_half, v_half, block_size, meta, output, num_tokens)
+        result = self._reference_forward(q3, k_half, v_half, block_size, meta, output, num_tokens)
+        _check_finite(result, "prefill.ref.out", meta)
+        return result
 
     def _log_prefill_share(self) -> None:
         """Report the kernel share of prefill steps (M1's exit criterion is >0.9).
@@ -686,9 +758,9 @@ class TileInferAttentionImpl(AttentionImpl):
         attn = self._decode_attn(q3.dtype)
         if attn is None:
             IMPL_COUNTERS.bump("kernel_path_unavailable")
-            return self._reference_forward(
-                q3, k_half, v_half, block_size, meta, output, num_tokens
-            )
+            result = self._reference_forward(q3, k_half, v_half, block_size, meta, output, num_tokens)
+            _check_finite(result, "decode.ref.out", meta)
+            return result
 
         sub = sub_pages(block_size)  # raises for a page that is not k*128 tokens
         # (b) Zero-copy kernel views of the two contiguous halves of the fused pool.
@@ -753,6 +825,11 @@ class TileInferAttentionImpl(AttentionImpl):
 
         # (d) Run and write the output.  `out_buf` is bucket-sized and owned by this layer, so the
         # call allocates nothing.
+        if _debug_nan_enabled():
+            # Sentinel: any head slot the kernel fails to write keeps +inf instead of silent stale
+            # data.  "NaN in two heads" and "two heads were never written" look identical in the
+            # output otherwise, and they are different bugs.
+            state.out_buf.fill_(float("inf"))
         attn.run(
             state.q_buf,
             state.k_pool,
@@ -763,6 +840,9 @@ class TileInferAttentionImpl(AttentionImpl):
             kv_indices=kv_indices,
             kv_last_page_len=step_buffers.last_page_len_buf,
         )
+        _check_finite(state.out_buf[:num_tokens], "decode.out", meta)
+        if _debug_nan_enabled():
+            _check_finite(state.out_buf[:num_tokens], "decode.sentinel", meta)
         return self._store_output(output, state.out_buf, num_tokens)
 
     def _build_plan(self, key: Tuple[object, ...], state: _BucketState) -> object:

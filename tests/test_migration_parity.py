@@ -67,6 +67,19 @@ PAIRS: Tuple[Tuple[str, str], ...] = (
 
 #: Bodies that differ, and why.  A new entry here is a decision; a new *difference* is a regression.
 EXPECTED_DIFFERENCES: Mapping[str, str] = {
+    "vllm/attn/impl.py::TileInferAttentionImpl.forward": (
+        "TILEINFER_DEBUG_NAN: three `_check_finite` calls on q/k/v before the KV write. Diagnostic "
+        "only - they return immediately unless the flag is set, so no arithmetic changes."
+    ),
+    "vllm/attn/impl.py::TileInferAttentionImpl._kernel_forward": (
+        "TILEINFER_DEBUG_NAN: one `_check_finite` on the decode output before it is copied to the "
+        "layer's output tensor. Diagnostic only."
+    ),
+    "vllm/attn/impl.py::TileInferAttentionImpl._prefill_forward": (
+        "TILEINFER_DEBUG_NAN: one `_check_finite` on the prefill result (kernel and reference paths). "
+        "Diagnostic only."
+    ),
+
     "vllm/ops/install.py::_installed_impl": (
         "one branch added ahead of the original two: an injected engine adapter wins over the "
         "family's own impl.  vLLM's `_custom_ops.topk_softmax`/`moe_align_block_size` write into "
@@ -657,8 +670,8 @@ def test_every_exclusion_gives_a_reason_a_reader_can_act_on(table: str) -> None:
 AUDIT_COUNTS = {
     "pairs": 31,
     "definitions": 415,
-    "definitions_identical": 400,
-    "definitions_explained": 15,
+    "definitions_identical": 397,
+    "definitions_explained": 18,
     "module_items": 521,
     "module_items_identical": 510,
     "module_items_explained": 11,
