@@ -533,7 +533,7 @@ def _install_ops() -> Dict[str, Any]:
     try:
         from ascend_platform.ops.install import install_ops
 
-        report = install_ops()
+        report = install_ops(engine_factories=_engine_factories())
     except Exception as exc:  # noqa: BLE001 - a general plugin must not raise
         info["detail"] = f"install_ops() raised {exc!r}; vLLM's own operators are still in place"
         logger.warning("ascend-platform ops: %s", info["detail"])
@@ -552,6 +552,38 @@ def _install_ops() -> Dict[str, Any]:
             report.details.get(op, "no reason recorded"),
         )
     return info
+
+
+def _engine_factories() -> Dict[str, Any]:
+    """The implementations whose *shape* is vLLM's, built here because this is the engine layer.
+
+    One entry today: ``engine.moe_method``.  On an out-of-tree platform vLLM 0.23 builds no routed
+    expert kernel at all (``oracle/unquantized.py:168-169`` returns ``experts_cls=None``), so the
+    unquantised MoE path is *expected* to be completed by a ``CustomOp.register_oot`` subclass.  The
+    subclass is ABI knowledge (``engine/abi/vllm_0_23.py``); the math it runs is the operator layer's
+    (``moe.experts``); the meeting point is here, and neither side imports the other.
+
+    Empty when the operator layer serves no MoE compute: then the slot stays unbound with a reason
+    instead of registering a class that would fail on the first forward.
+    """
+    from ascend_platform.contracts.provider import provider
+
+    serving = provider()
+    if serving is None:
+        return {}
+    compute, why = serving.load("moe.experts")
+    if compute is None:
+        compute, why = serving.load("moe.experts_unquantized")
+    if compute is None:
+        logger.info(
+            "ascend-platform OOT MoE: no routed-expert compute published (%s); the engine.moe_method "
+            "slot stays unbound",
+            why,
+        )
+        return {}
+    from ascend_platform.engine.abi import vllm_0_23
+
+    return {"engine.moe_method": vllm_0_23.moe_method_factory(compute)}
 
 
 # =============================================================================================

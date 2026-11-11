@@ -71,7 +71,7 @@ docs/                  hardware-checklist hardware-facts + 4 篇设计文档 + �
 不可读，也会让 `reference/` 里的引用对不上。改名是一次独立的、机械的、可验证的提交，
 放在测试全绿之后。
 
-## 2.1 完整性审计：定义级 404/415 + 模块级 511/521 + 装饰器 456/456 + 调用级 1045
+## 2.1 完整性审计：定义级 401/415 + 模块级 510/521 + 装饰器 456/456 + 调用级 1045
 
 "一行不落地搬过来"是可证伪的说法，所以它被写成了三层测试
 （[`tests/test_migration_parity.py`](tests/test_migration_parity.py)；源仓库不在时整文件跳过）。
@@ -445,6 +445,51 @@ vLLM 0.23.0 | strict=False | patches: 3 applied, 0 skipped (target gone), 0 fail
 
 这两条都不是本仓的 bug，是"平台与引擎的契约在真卡上长什么样"，所以写进手册而不是代码。
 
+### 4.13 三个仓库拆分之后，"算子绑定"从整表变成逐项，并第一次有了 provider 契约
+
+现象：把 `ASCEND_PLATFORM_OPS` 指向拆分出来的算子仓后，13 个必需算子有 8 个在它里面确实存在，
+却**一个都没绑上**，横幅给的原因是 `Check ModelProfile.op_family`——而真实原因是缺一个模块。
+
+三个原因叠在一起：
+
+1. 家族表在表头无条件 import 每个算子模块，缺一个就整表构造失败
+   （`ops/families/gdn_moe.py` 的旧写法），`install._resolve_families` 又把异常吞成空表；
+2. 端口的实现解析**硬编码内部路径**（`contracts/ports.py` 的 `_LAYOUTS`），于是"能 import"被当成
+   "该由它提供"，而"该由谁提供"从来没有被问过；
+3. 描述符（`manifest.json` / `describe()`）在 `src/` 里没有调用点，所以算子仓声明了什么从不参与启动。
+
+改法（P0，本仓）：
+
+- `ops/families/gdn_moe.py`：逐个名字解析，miss 记在**该算子自己**身上
+  （`OpBinding.impl_note`），`install._plan` 把它原样报出来；
+- `contracts/provider.py`（新）：provider 契约——描述符（纯数据）+ 发现（`ASCEND_PLATFORM_OPS`
+  指向的包优先，其次是 `ascend_platform.providers` entry point）+ 逐项 `load()`；坏描述符、版本
+  越界、目标 import 不到都只影响那一个算子，启动继续；
+- 家族表**先问 provider、再回落到布局路径**，语义名与 vLLM 符号名分开：`moe.routing_topk_softmax`
+  这类语义名是问 provider 的键，`_LAYOUTS` 的路径只是旧层的兜底；
+- `_acl.py` 里那份重复的 `OPERATOR_ROOTS` 删掉，归 `contracts/ports.py`（它的**顺序就是优先级**）；
+- `_resolve_families` 显式先解析一次算子层，好让"什么都没装"仍然是一句话，而不是 13 条 unbound；
+- `doctor` 的绑定检查前面加一段 `provider <名字> <版本> (<n> op(s))`：装了不止一个算子包时，
+  "10 bound" 在知道"谁供的"之前不可行动。
+
+实测（装了 `ascend_attention`，真 vLLM 0.23 符号）：
+
+| 阶段 | 结果 |
+|---|---|
+| 改之前 | **0 bound**，横幅把原因指向 `op_family` |
+| 逐项绑定 + provider 发现 | 10 bound / 2 unbound / 1 off |
+| 再加 `engine/abi`（符号表 + MoE 类工厂） | **11 bound / 1 unbound / 1 off** |
+
+最后剩下的那 1 个 unbound 是 `chunk_local_cumsum`——我们**刻意** decline（FLA 的签名不是 drop-in），
+它带的是自己的理由而不是"模块缺失"。`silu_and_mul` 只是 `dense` 族默认关闭。
+
+这一轮还证明了一件事：`unquantized_fused_moe` 之所以一直绑不上，缺的**不是**算子仓的实现，而是
+本仓的 ABI 层——算子仓提供 compute，`engine/abi/vllm_0_23.py` 把它包成 vLLM 的
+`UnquantizedFusedMoEMethod` 子类，两端谁都不知道对方的目录结构。语义名词表
+（`contracts/vocabulary.py`）给这条路径加了类别检查：一个 `kind="compute"` 的实现**不能**被绑到
+`class_factory` 槽上——那正是这一轮发现的真实陷阱（算子仓给 `unquantized_fused_moe` 发了个别名，
+指向纯 compute；照绑会在模型加载时才炸）。
+
 ## 5. 新增的测试（不是在搬运）
 
 | 文件 | 钉住什么 |
@@ -479,6 +524,9 @@ vLLM 0.23.0 | strict=False | patches: 3 applied, 0 skipped (target gone), 0 fail
 查找、`utils.py` 的 2 的幂与设备回退都没被执行过。它们全是不需要设备就能测的纯逻辑，于是补了
 上面三处断言（平台子类、profile 几何、provider 接线）与 `test_utils_helpers.py`。覆盖度不是目标，
 **"整文件没人跑过"才是**。
+
+| `tests/test_engine_abi.py` | ABI 层：符号表完整且与绑定表一致（漂移即报，两个名字都打出来）、`experts_cls.is_monolithic()`（**方法**）与 `moe_kernel.is_monolithic`（**属性**）两种调用约定、`apply` 确实走到注入的 compute、`shared_experts` 不被重复加、非 OOT 后端拒绝构造、上游替换 kernel 时大声报错、import 本模块不拉 `vllm` |
+| `tests/test_provider_contract.py` | provider 契约：两种描述符形状、坏字段/坏区间/坏目标的措辞、`ASCEND_PLATFORM_OPS` 优先于 entry point、坏 provider 不拖垮启动、`load()` 的 miss 句子、provider 胜于布局路径、compute 不能冒充 class factory |
 
 ## 5.5 许可证
 

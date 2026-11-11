@@ -210,14 +210,34 @@ def test_every_binding_names_a_vllm_target_and_justifies_itself():
 
 
 @pytest.mark.skipif(operator_available(), reason="an operator layer is installed here")
-def test_without_an_operator_layer_the_table_refuses_with_a_readable_reason():
-    """The failure mode matters: a missing layer must name the candidates and the fix, not traceback."""
+def test_without_an_operator_layer_the_report_names_the_candidates_and_the_fix():
+    """The failure mode matters: a missing layer must name the candidates and the fix, not traceback.
+
+    ``required_names()`` is *data* now and answers without a layer - the requirement list is what
+    the platform asks for, not something it learns by importing.  The canonical sentence moved to
+    the install report, which is where a reader meets it (banner, ``doctor``), and the per-op
+    reasons stay per-op: 13 unbound entries that each say "the operator layer has no ..." are a
+    worse answer than one sentence naming the candidates, and counting them cannot tell you
+    whether the layer is absent or half-installed.
+    """
     from ascend_platform.contracts.ports import OperatorLayerUnavailable
 
+    assert len(install_mod.required_names()) == 13, "the requirement list must not need a layer"
+
     with pytest.raises(OperatorLayerUnavailable) as excinfo:
-        install_mod.required_names()
+        from ascend_platform.contracts.ports import operator_layer
+
+        operator_layer(required=True)
     message = str(excinfo.value)
     assert "ascend_attention" in message and "ASCEND_PLATFORM_OPS" in message
+
+    report = install_mod.install_ops()
+    try:
+        assert report.layer_error, "a missing layer must be recorded, not inferred from 13 unbound"
+        assert "ascend_attention" in report.layer_error
+        assert report.bound == []
+    finally:
+        install_mod._reset()
 
 
 @pytest.mark.skipif(not operator_available(), reason="the binding table needs an operator layer")

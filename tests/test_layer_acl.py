@@ -141,6 +141,13 @@ def test_the_dependency_direction_holds(path: pathlib.Path) -> None:
     assert not offenders, f"{path.relative_to(ROOT)}: {offenders}"
 
 
+def _operator_roots():
+    """The port's list, not a copy: the ACL rule is about *which* packages, and the port owns them."""
+    from ascend_platform.contracts.ports import OPERATOR_ROOTS
+
+    return OPERATOR_ROOTS
+
+
 def test_only_the_port_imports_an_operator_package():
     offenders = []
     for path in ALL_FILES:
@@ -149,7 +156,7 @@ def test_only_the_port_imports_an_operator_package():
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for module, line in _all_imports(tree):
-            if any(_matches(module, root) for root in _acl.OPERATOR_ROOTS):
+            if any(_matches(module, root) for root in _operator_roots()):
                 offenders.append(f"{relative}:{line} -> {module}")
     assert not offenders, (
         f"operator packages may only be reached through {_acl.PORT_MODULE}: {offenders}"

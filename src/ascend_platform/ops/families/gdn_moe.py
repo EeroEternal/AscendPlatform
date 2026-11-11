@@ -57,6 +57,127 @@ NAME = "gdn-moe"
 #: had before the candidate seam existed.
 BASELINE_NAME = "torch"
 
+
+def set_engine_factories(factories: Mapping[str, Any]) -> None:
+    """Publish engine-side implementations (see :func:`_Impl.impl`).
+
+    Delegates to the registry in the package ``__init__`` so there is one storage point; the
+    resolver reads :func:`engine_factories` on every lookup.  No cache to invalidate: ``bind()``
+    builds a fresh resolver per call, so the next table sees the published factory (a module-level
+    resolver cache would have made this publish-before-bind ordering dependent).
+    """
+    from ascend_platform.ops.families import set_engine_factories as publish
+
+    publish(factories)
+
+
+def _wrong_kind(op: str, served: Any) -> bool:
+    """Does the provider's entry for ``op`` have the wrong shape for the binding that asks for it?
+
+    Two independent sources must agree before this answers anything:
+
+    * the **vocabulary** (``contracts/vocabulary.py``) declares which names are factory slots;
+    * the **descriptor** declares what the provider actually published (``kind``).
+
+    Either side being silent means "no objection" - an operator package may serve names the platform
+    has not learned yet, and an untyped entry keeps working exactly as before.  Only a declared
+    factory slot served as compute (the real bug: ``unquantized_fused_moe`` aliased to the compute
+    function) is refused.
+    """
+    from ascend_platform.contracts.vocabulary import OpKind, requires_factory
+
+    if served is None:
+        return False
+    if requires_factory(op) and served.kind is not OpKind.CLASS_FACTORY:
+        return True
+    if not requires_factory(op) and served.kind is OpKind.CLASS_FACTORY:
+        return True
+    return False
+
+
+class _Impl:
+    """Resolve ``(impl, note)`` pairs from the operator layer, one name at a time.
+
+    The operator layer is imported through ``contracts.ports`` so the platform keeps a single
+    dependency direction.  Any failure - the module is absent (the migration's own split, where
+    ``fused_moe_oot`` lives only in the source repo), the attribute is gone, the module needs a
+    device - is recorded against the one name that needed it.  Resolution is cached because the
+    table is rebuilt on every ``install_ops`` after ``_reset`` and the misses are deterministic.
+    """
+
+    def __init__(self) -> None:
+        self._cache: dict = {}
+
+    def impl(self, op: str, module: str, attribute: str, *, ask_provider: bool = True):
+        """Resolve one op: the **provider** first, then the legacy module layout.
+
+        ``op`` is the *semantic* name when the two sides share one (``moe.routing_topk_softmax``,
+        ``moe.experts``, ...) and the vLLM-facing name when they do not - the provider is asked for
+        that key, so a name the provider does not serve is reported as "the provider does not serve
+        it" instead of silently falling through.  The vLLM-facing name stays the fallback key for
+        the layout path, because that is what ``ports._LAYOUTS`` addresses.
+
+        Three sources, in this order:
+
+        1. an **engine-published** implementation (``install_ops(engine_factories=...)``) - the only
+           one that can supply a ``class_factory``, because only ``engine/abi`` knows vLLM's class
+           extension point;
+        2. the **provider** (``contracts/provider.py``): a package says which op names it serves and
+           where they live, so the platform does not have to know its directory structure;
+        3. the **legacy layout** (``ports._LAYOUTS``), kept for layers that publish no descriptor.
+        The layout path stays as the fallback for a layer that installs no descriptor - which is
+        every layer today, including ``ascend_attention``, whose descriptor is the next step on that
+        side.  Both paths are tolerant: a miss is a fact about this op.
+        """
+        key = (op, module, attribute)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+
+        from ascend_platform.contracts.provider import provider as _provider
+
+        from ascend_platform.ops.families import engine_factories
+
+        published = engine_factories().get(op)
+        if published is not None:
+            self._cache[key] = (published, "")
+            return self._cache[key]
+
+        provider = _provider() if ask_provider else None
+        if provider is not None:
+            value, provider_note = provider.load(op)
+            if value is not None and _wrong_kind(op, provider.op(op)):
+                # The provider serves this name, but with the wrong *shape*: a plain compute
+                # function where the record needs ``base_cls -> subclass`` (or vice versa).  Binding
+                # it would look like success and fail at model instantiation, so it is refused here
+                # with the vocabulary as the authority, and the layout path is not consulted either
+                # (it would hand back the same function under another name).
+                self._cache[key] = (None, provider_note)
+                return self._cache[key]
+            if value is not None:
+                self._cache[key] = (value, "")
+                return self._cache[key]
+        else:
+            provider_note = ""
+
+        from ascend_platform.contracts.ports import ops_module
+
+        try:
+            value = getattr(ops_module(module), attribute)
+        except Exception as exc:  # noqa: BLE001 - "this op is missing" is data, not a crash
+            note = (
+                f"the operator layer has no {module}.{attribute} ({type(exc).__name__}: {exc}); "
+                "this op stays on vLLM's own implementation"
+            )
+            if provider_note:
+                note = f"{provider_note}; {note}"
+            result = (None, note)
+        else:
+            result = (value, "")
+        self._cache[key] = result
+        return result
+
+
 #: Module paths of the two vLLM files the GDN layer builds its call sites out of.
 _GDN = "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn"
 _FLA = "vllm.model_executor.layers.fla.ops"
@@ -215,20 +336,40 @@ def bind() -> List[Any]:
     # Imported here, not at module level: ``install`` imports this module, so the data class has to
     # come from the already-loaded install module (a top-level import would be circular), and the
     # operator modules import torch.
-    from ascend_platform.contracts.ports import ops_module
-
-    # The implementations belong to the operator layer; this table only names them.
-    moe = ops_module("moe")
-    fused_moe_oot = ops_module("fused_moe_oot")
-    causal_conv1d = ops_module("fla.causal_conv1d")
-    chunk = ops_module("fla.chunk")
-    gating = ops_module("fla.gating")
-    post_conv = ops_module("fla.post_conv")
-    recurrent = ops_module("fla.recurrent")
-    gdn = ops_module("gdn")
-    chunk_local_cumsum = gdn.chunk_local_cumsum
-    l2norm_fwd = gdn.l2norm_fwd
     from ascend_platform.ops.install import OpBinding
+
+    # The implementations belong to the operator layer; this table only names them.  Resolution is
+    # per name, not per module: a layer that ships eleven of these and not the twelfth used to raise
+    # on the first missing module and take the whole table with it, so thirteen required ops ended
+    # up "0 bound" with one warning that blamed the model profile.  Now the miss is a property of
+    # the one record that needs it (``impl=None`` + ``impl_note``) and ``install._plan`` reports it.
+    resolver = _Impl()
+
+    moe_topk = resolver.impl("moe.routing_topk_softmax", "moe", "topk_softmax")
+    moe_align = resolver.impl("moe.align_block_size", "moe", "moe_align_block_size")
+    moe_experts = resolver.impl("moe.experts", "moe", "fused_experts")
+    moe_unquantized = resolver.impl("unquantized_fused_moe", "moe", "unquantized_fused_moe")
+    moe_silu = resolver.impl("moe.swiglu_gate", "moe", "silu_and_mul")
+    # ``engine.moe_method`` is a **factory slot** in the vocabulary, so the provider may serve it
+    # only with ``kind="class_factory"``; the alias ``unquantized_fused_moe`` (plain compute) is
+    # refused by ``_wrong_kind`` instead of being bound as a factory and failing at model-load time.
+    # Turning a compute function into vLLM's method object is the engine-ABI layer's job
+    # (``engine/abi/``), so until that factory is published this op stays unbound - with the reason.
+    oot_method = resolver.impl("engine.moe_method", "fused_moe_oot", "make_oot_method")
+    chunk_rule = resolver.impl("chunk_gated_delta_rule", "fla.chunk", "chunk_gated_delta_rule")
+    conv_fn = resolver.impl("causal_conv1d_fn", "fla.causal_conv1d", "causal_conv1d_fn")
+    conv_update = resolver.impl("causal_conv1d_update", "fla.causal_conv1d", "causal_conv1d_update")
+    gating_update = resolver.impl(
+        "fused_sigmoid_gating_delta_rule_update", "fla.gating", "fused_sigmoid_gating_delta_rule_update"
+    )
+    recurrent_decode = resolver.impl(
+        "fused_recurrent_gated_delta_rule_packed_decode",
+        "fla.recurrent",
+        "fused_recurrent_gated_delta_rule_packed_decode",
+    )
+    post_conv_prep = resolver.impl("fused_post_conv_prep", "fla.post_conv", "fused_post_conv_prep")
+    l2norm = resolver.impl("l2norm_fwd", "gdn", "l2norm_fwd")
+    cumsum = resolver.impl("chunk_local_cumsum", "gdn", "chunk_local_cumsum")
 
     op_consumer = "module-global call in _forward_core"
     records = [
@@ -237,7 +378,8 @@ def bind() -> List[Any]:
             family="gdn",
             targets=(f"{_GDN}.ChunkGatedDeltaRule",),
             kind="custom_op",
-            impl=chunk.chunk_gated_delta_rule,
+            impl=chunk_rule[0],
+            impl_note=chunk_rule[1],
             why=(
                 "GDN prefill runs through the CustomOp ChunkGatedDeltaRule "
                 "(qwen_gdn_linear_attn.py:290-311); on a non-CUDA platform its __init__ pins "
@@ -259,7 +401,8 @@ def bind() -> List[Any]:
             family="gdn",
             targets=(f"{_FLA}.l2norm.l2norm_fwd",),
             aliases=(f"{_FLA}.chunk.l2norm_fwd", f"{_GDN}.l2norm_fwd"),
-            impl=l2norm_fwd,
+            impl=l2norm[0],
+            impl_note=l2norm[1],
             why=(
                 "q/k normalisation inside the GDN chain; upstream's body is a Triton kernel "
                 "(fla_l2norm.py:114-149) and the signature is identical (x, eps=1e-6, "
@@ -274,7 +417,8 @@ def bind() -> List[Any]:
             family="gdn",
             targets=(f"{_MAMBA}.causal_conv1d.causal_conv1d_fn",),
             aliases=(f"{_GDN}.causal_conv1d_fn",),
-            impl=causal_conv1d.causal_conv1d_fn,
+            impl=conv_fn[0],
+            impl_note=conv_fn[1],
             why=(
                 "GDN prefill conv over the packed batch; upstream is the Triton "
                 "_causal_conv1d_fwd_kernel (vllm ...mamba/ops/causal_conv1d.py:16-746). Our "
@@ -290,7 +434,8 @@ def bind() -> List[Any]:
             family="gdn",
             targets=(f"{_MAMBA}.causal_conv1d.causal_conv1d_update",),
             aliases=(f"{_GDN}.causal_conv1d_update",),
-            impl=causal_conv1d.causal_conv1d_update,
+            impl=conv_update[0],
+            impl_note=conv_update[1],
             why=(
                 "GDN decode/decode-spec conv state update; upstream is "
                 "_causal_conv1d_update_kernel (:749-1067). Our signature is the wrapper's verbatim "
@@ -305,7 +450,8 @@ def bind() -> List[Any]:
             family="gdn",
             targets=(f"{_FLA}.fused_sigmoid_gating.fused_sigmoid_gating_delta_rule_update",),
             aliases=(f"{_GDN}.fused_sigmoid_gating_delta_rule_update",),
-            impl=gating.fused_sigmoid_gating_delta_rule_update,
+            impl=gating_update[0],
+            impl_note=gating_update[1],
             why=(
                 "Per-decode-step gate + state update (sigmoid gating, unavoidable on the decode "
                 "path); upstream is a Triton kernel (fla_fused_sigmoid_gating.py:24-179) with the "
@@ -322,7 +468,8 @@ def bind() -> List[Any]:
                 f"{_FLA}.fused_recurrent.fused_recurrent_gated_delta_rule_packed_decode",
             ),
             aliases=(f"{_GDN}.fused_recurrent_gated_delta_rule_packed_decode",),
-            impl=recurrent.fused_recurrent_gated_delta_rule_packed_decode,
+            impl=recurrent_decode[0],
+            impl_note=recurrent_decode[1],
             why=(
                 "Packed recurrent decode (one token per sequence) used when "
                 "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE is on; upstream is a Triton kernel "
@@ -338,7 +485,8 @@ def bind() -> List[Any]:
             family="gdn",
             targets=(f"{_FLA}.cumsum.chunk_local_cumsum",),
             aliases=(f"{_GDN}.chunk_local_cumsum",),
-            impl=chunk_local_cumsum,  # the real port; abi_ok=False is about the call contract
+            impl=cumsum[0],  # the real port; abi_ok=False is about the call contract
+            impl_note=cumsum[1],
             abi_ok=False,            abi_note=(
                 "declined - not a drop-in: upstream takes (g, chunk_size, reverse, cu_seqlens, "
                 "chunk_indices, head_first, output_dtype) and handles 3-D/4-D layouts "
@@ -358,7 +506,8 @@ def bind() -> List[Any]:
             family="gdn",
             targets=(f"{_FLA}.fused_gdn_prefill_post_conv.fused_post_conv_prep",),
             aliases=(f"{_GDN}.fused_post_conv_prep",),
-            impl=post_conv.fused_post_conv_prep,
+            impl=post_conv_prep[0],
+            impl_note=post_conv_prep[1],
             why=(
                 "GDN prefill's post-conv prep: splits the packed q|k|v conv output, L2-normalises "
                 "q/k, and builds the log gate g and the delta-rule beta. The layer calls it before "
@@ -385,7 +534,8 @@ def bind() -> List[Any]:
             op="topk_softmax",
             family="moe",
             targets=("vllm._custom_ops.topk_softmax",),
-            impl=moe.topk_softmax,
+            impl=moe_topk[0],
+            impl_note=moe_topk[1],
             why=(
                 "MoE routing. vLLM 0.23 calls the wrapper in vllm/_custom_ops.py:2494-2509, i.e. "
                 "torch.ops._moe_C.topk_softmax (:2502) - a compiled CUDA kernel that does not exist "
@@ -406,7 +556,8 @@ def bind() -> List[Any]:
             op="moe_align_block_size",
             family="moe",
             targets=("vllm._custom_ops.moe_align_block_size",),
-            impl=moe.moe_align_block_size,
+            impl=moe_align[0],
+            impl_note=moe_align[1],
             why=(
                 "Builds the padded per-expert slot layout the grouped GEMM consumes. The call site "
                 "is vllm/_custom_ops.py:2346-2363 (torch.ops._moe_C.moe_align_block_size at :2355), "
@@ -430,7 +581,8 @@ def bind() -> List[Any]:
             op="fused_experts",
             family="moe",
             targets=("vllm.model_executor.layers.fused_moe.fused_moe.fused_experts",),
-            impl=moe.fused_experts,
+            impl=moe_experts[0],
+            impl_note=moe_experts[1],
             why=(
                 "The billed MoE expert MLP (SwiGLU + weighted top-k combine). The Python call site "
                 "is .../fused_moe/fused_moe.py:1474-1515, which forwards every argument to "
@@ -473,7 +625,8 @@ def bind() -> List[Any]:
                 ".UnquantizedFusedMoEMethod",
                 "vllm.model_executor.layers.fused_moe.UnquantizedFusedMoEMethod",
             ),
-            impl=fused_moe_oot.make_oot_method,
+            impl=oot_method[0],
+            impl_note=oot_method[1],
             why=(
                 "The routed-expert MoE kernel on an OOT platform. vLLM 0.23 selects "
                 "UnquantizedMoeBackend.OOT and returns experts_cls=None (oracle/unquantized.py:168-"
@@ -513,7 +666,8 @@ def bind() -> List[Any]:
                 "vllm._custom_ops.silu_and_mul",
                 "vllm.model_executor.layers.activation.silu_and_mul",
             ),
-            impl=moe.silu_and_mul,
+            impl=moe_silu[0],
+            impl_note=moe_silu[1],
             why=(
                 "SwiGLU activation for the dense/shared MLP and the expert path; upstream is "
                 "torch.ops._C.silu_and_mul. Family 'dense' is OFF by default (switch.py): the "

@@ -52,6 +52,10 @@ __all__ = [
 ENV_OPS_LAYER = "ASCEND_PLATFORM_OPS"
 
 #: Candidate roots, in preference order: the target layer first, the migration source second.
+#: The order **is** the policy - ``_candidates()`` returns this tuple when nothing is pinned, and
+#: the first root that imports wins.  This is the only declaration of the list; the ACL table used
+#: to carry a second copy (reversed, and order-insensitive where it was read), which is exactly the
+#: kind of duplicate that makes a reader believe there is a preference conflict where there is none.
 OPERATOR_ROOTS: Tuple[str, ...] = ("ascend_attention", "tileinfer")
 
 #: The logical modules the platform may ask for; a layout must name every one of them.

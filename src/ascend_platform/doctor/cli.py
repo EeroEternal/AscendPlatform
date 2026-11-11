@@ -665,6 +665,18 @@ def _check_ops_binding() -> Tuple[str, str, str]:
     declined = {binding.op for binding in bindings() if not binding.abi_ok}
     unexpected = [op for op in report.unbound if op not in declined]
     detail = report.summary()
+    # Which provider answered, before which ops bound: with more than one operator package
+    # installed, "10 bound" is not actionable until the reader knows who served them.
+    try:
+        from ascend_platform.contracts.provider import describe_provider
+
+        info = describe_provider()
+    except Exception:  # noqa: BLE001 - a provider probe must never fail the check
+        info = {"available": False}
+    if info.get("available"):
+        detail = (
+            f"provider {info['name']} {info['version']} ({len(info['ops'])} op(s)) | " + detail
+        )
     if report.bound:
         detail += " | bound: " + ", ".join(report.bound)
     if declined:

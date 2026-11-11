@@ -68,7 +68,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ascend_platform.runtime import phases as _phases
 
@@ -101,6 +101,7 @@ from ascend_platform.contracts.ports import (
 )
 from ascend_platform.contracts.version import IncompatibleVersion
 from ascend_platform.engine.compat import patches
+from ascend_platform.ops import families as families_module
 from ascend_platform.ops.families import family_for
 from ascend_platform.ops.switch import ENV_OPS, OPS_ALL, OPS_DEFAULT_ON, ops_enabled
 
@@ -151,6 +152,10 @@ class OpBinding:
     kind: str = "attr"
     abi_ok: bool = True
     abi_note: str = ""
+    #: Why this op has no implementation, when it has none.  A family resolves its implementations
+    #: one at a time, so a module that is missing from the operator layer is a fact about *this* op
+    #: and must not take the other twelve with it (that was the 8-of-13-exist-and-0-bind failure).
+    impl_note: str = ""
     #: The per-op candidate seam (``ascend_platform.ops.candidates``) when the family registers one:
     #: ``impl`` stays the **baseline** implementation, so every report, doctor line and test that
     #: names the implementation keeps naming it; what gets bound is ``candidates.dispatched()``.
@@ -622,9 +627,13 @@ def _plan(binding: OpBinding, report: OpsReport, registered: List[str]) -> str:
         return "unbound"
     if binding.impl is None:
         report.details[binding.op] = (
-            "unbound: no torch implementation in ascend_platform.ops; the layer calls "
-            f"{binding.targets[0] if binding.targets else '(unknown name)'} and there is no "
-            "fallback for it on Ascend"
+            f"unbound: {binding.impl_note}"
+            if binding.impl_note
+            else (
+                "unbound: no torch implementation in ascend_platform.ops; the layer calls "
+                f"{binding.targets[0] if binding.targets else '(unknown name)'} and there is no "
+                "fallback for it on Ascend"
+            )
         )
         return "unbound"
 
@@ -673,8 +682,19 @@ def _plan(binding: OpBinding, report: OpsReport, registered: List[str]) -> str:
 
 
 def _resolve_families(report: "OpsReport") -> List[Tuple[str, str, Sequence[Any]]]:
-    """The active profile's operator families, or ``[]`` with the reason recorded in ``report``."""
+    """The active profile's operator families, or ``[]`` with the reason recorded in ``report``.
+
+    The layer is resolved *first*, through the raising form, for one reason: "nothing is installed"
+    and "the installed layer is missing two of thirteen names" are different situations and the
+    reader must not have to tell them apart by counting.  The first produces one canonical sentence
+    naming the candidates and ``ASCEND_PLATFORM_OPS``; the second produces a table with a per-op
+    reason.  A family whose table is data (``required_names()``) no longer raises on import, so the
+    check has to be explicit here rather than a side effect of ``bind()``.
+    """
+    from ascend_platform.contracts.ports import operator_layer
+
     try:
+        operator_layer(required=True)  # raises the canonical message when nothing is importable
         return _families()
     except OperatorLayerUnavailable as exc:
         # A distinct case from "the table is wrong": nothing can be bound because the
@@ -697,13 +717,22 @@ def _resolve_families(report: "OpsReport") -> List[Tuple[str, str, Sequence[Any]
         return []
 
 
-def install_ops() -> OpsReport:
+def install_ops(engine_factories: Optional[Mapping[str, Callable[[type], type]]] = None) -> OpsReport:
     """Wire every family the active model profile names into vLLM's dispatch; never raises.
+
+    ``engine_factories`` is how the **engine layer** publishes an implementation whose shape is
+    engine-specific (``kind="custom_op_oot"``: ``impl(base_cls) -> subclass``).  It is injected rather
+    than imported because the dependency direction is ``engine -> ops``: the family table must not
+    import ``engine/abi``, and ``engine/abi`` must not import an operator package.  Keys are semantic
+    names from ``contracts/vocabulary.py`` (today: ``engine.moe_method``); the plugin passes
+    ``{"engine.moe_method": vllm_0_23.moe_method_factory(compute)}``.
 
     Idempotent: the second call in a process returns the first call's report unchanged.  The
     install is *planned* against the live module tree before anything is applied, so a vLLM point
     release that moved a symbol shows up as an ``unbound`` line naming the exact target.
     """
+    if engine_factories:
+        families_module.set_engine_factories(engine_factories)
     with _LOCK:
         cached = _STATE.get("report")
         if _STATE.get("installed") and isinstance(cached, OpsReport):

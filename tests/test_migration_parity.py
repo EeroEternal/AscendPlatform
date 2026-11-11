@@ -92,6 +92,24 @@ EXPECTED_DIFFERENCES: Mapping[str, str] = {
     "vllm/ops/families/gdn_moe.py::_reference_experts": (
         "the oracle and the unquantised-config refusal are resolved through the operator port"
     ),
+    "vllm/ops/install.py::_plan": (
+        "the impl-missing branch prefers OpBinding.impl_note: a family now resolves each "
+        "implementation separately, so 'which name is missing from the operator layer, and why' is "
+        "recorded per op instead of the whole table failing to build.  The abi_ok / target-resolution "
+        "/ alias branches are unchanged"
+    ),
+    "vllm/plugin.py::_install_ops": (
+        "one keyword argument: install_ops(engine_factories=_engine_factories()).  The MoE method "
+        "class is a vLLM shape (CustomOp.register_oot), so it is built in engine/abi and injected - "
+        "the alternative was ops/families importing engine/abi, which is the wrong direction "
+        "(engine -> ops).  Everything else in the wrapper is unchanged"
+    ),
+    "vllm/doctor.py::_check_ops_binding": (
+        "one segment prepended to the detail line: 'provider <name> <version> (<n> op(s))'.  With "
+        "more than one operator package installable, '10 bound' is not actionable until the reader "
+        "knows who served them - and the provider is the new contract (contracts/provider.py).  The "
+        "bind/decline/unexpected decision itself is unchanged"
+    ),
     "vllm/doctor.py::_run_check": (
         "a third branch: OperatorLayerUnavailable is an environment state ('install the operator "
         "layer or set ASCEND_PLATFORM_OPS'), not a bug in this package - the generic branch told the "
@@ -296,6 +314,11 @@ EXPECTED_MODULE_LEVEL: Mapping[str, str] = {
     "vllm/doctor.py::_HEADER": (
         "the banner is now 'ascend-platform doctor'; the source repo's name is not printed by a "
         "package called ascend_platform"
+    ),
+    "vllm/ops/install.py::class OpBinding": (
+        "one field added: impl_note carries 'the operator layer has no <module>.<attr>' for the one "
+        "record that needs it, so a half-installed layer reports per op instead of 0 bound with a "
+        "warning that blames the model profile"
     ),
     "vllm/graphs.py::UNMAPPED_TORCH_CUDA_NAMES": (
         "two entries appended: `_is_compiled` / `is_initialized` are used by "
@@ -625,11 +648,11 @@ def test_every_exclusion_gives_a_reason_a_reader_can_act_on(table: str) -> None:
 AUDIT_COUNTS = {
     "pairs": 31,
     "definitions": 415,
-    "definitions_identical": 404,
-    "definitions_explained": 11,
+    "definitions_identical": 401,
+    "definitions_explained": 14,
     "module_items": 521,
-    "module_items_identical": 511,
-    "module_items_explained": 10,
+    "module_items_identical": 510,
+    "module_items_explained": 11,
     "decorated": 456,
     "calls": 1045,
 }

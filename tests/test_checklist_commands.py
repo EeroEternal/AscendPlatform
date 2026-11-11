@@ -181,6 +181,13 @@ def _resolves(dotted: str) -> bool:
     )
 
 
+def _provider_entry_point_group() -> str:
+    """The provider group string - the one dotted ``ascend_platform.*`` name that is not a module."""
+    from ascend_platform.contracts.provider import PROVIDER_GROUP
+
+    return PROVIDER_GROUP
+
+
 def test_no_document_names_a_module_or_member_that_does_not_exist() -> None:
     """Checks every ``ascend_platform.…`` name the documentation tells a reader to use.
 
@@ -197,6 +204,8 @@ def test_no_document_names_a_module_or_member_that_does_not_exist() -> None:
         for dotted in sorted(set(re.findall(r"\b(ascend_platform(?:\.[a-z_][\w]*)+)", text))):
             if dotted.endswith(("__file__", "__version__")):
                 continue  # attributes of the package object itself, not paths a reader imports
+            if dotted == _provider_entry_point_group():
+                continue  # an entry-point *group* name, not a module: it has no file to resolve
             checked += 1
             if not _resolves(dotted):
                 missing.append(f"{path.relative_to(ROOT)}: {dotted}")

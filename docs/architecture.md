@@ -27,18 +27,20 @@
 | 模型事实 | `profiles/` | 头维度、页策略、混合层比例（按模型） | 设备常量、算子实现 |
 | 运行时骨架 | `runtime/` | 页几何、规划器、step 记账、计数器、开关 | 任何 vLLM 类型 |
 | 算子接入 | `ops/` | 名字 → 实现的绑定表、来源切换、候选集 | 算子数学 |
-| 引擎 | `engine/` | vLLM 平台/worker/图/注意力/模型适配、插件入口 | 算子数学、设备常量字面量 |
+| 引擎 | `engine/` | vLLM 平台/worker/图/注意力/模型适配、插件入口；`engine/abi/` 放随引擎版本走的符号表与类扩展点 | 算子数学、设备常量字面量 |
 | 自检 | `doctor/` | 一条命令跑完 bring-up 清单 | 修复、隐式安装 |
 
-`engine/` 是唯一允许 `import vllm` 的层（`tests/test_package_layout.py` 里有一份审阅过的
+`engine/` 是唯一允许 `import vllm` 的层（`engine/abi/vllm_0_23.py` 目前只用字符串持有符号路径，
+所以它连 import 都不需要——测试钉住"import 它不会把 vllm 拉进来"）（`tests/test_package_layout.py` 里有一份审阅过的
 白名单，新增文件必须先进白名单）。`runtime/`、`device/`、`contracts/` 只依赖标准库和 torch，
 所以它们在 CPU 机器上完全可测。
 
 ## 3. 依赖方向（单向）
 
 这份表在代码里有一份可读副本：[`src/ascend_platform/_acl.py`](../src/ascend_platform/_acl.py)
-（`ALLOWED_IMPORTS` / `ENGINE_FREE` / `OPERATOR_ROOTS`）。它是唯一来源——文档、测试、`doctor`
-都读它，不各写一份。
+（`ALLOWED_IMPORTS` / `ENGINE_FREE`）。分层规则以它为准，文档、测试、`doctor` 都读这一份。
+算子包的根不在这里：`OPERATOR_ROOTS` 归 `contracts/ports.py`，因为它的**顺序就是优先级**，而消费
+顺序的是端口的 `_candidates()`。
 
 ```
 doctor ──► engine ──► ops ──► contracts

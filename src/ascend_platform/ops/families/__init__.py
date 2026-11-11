@@ -22,6 +22,8 @@ __all__ = [
     "unregister_family",
     "family_for",
     "family_names",
+    "set_engine_factories",
+    "engine_factories",
 ]
 
 #: ``name -> family module`` (module objects expose ``required_names()`` and ``bind()``).
@@ -96,6 +98,24 @@ def family_for(name: str) -> Any:
                 f"known families: {family_names()}"
             )
     return module
+
+
+#: Implementations whose *shape* is the engine's (``kind="custom_op_oot"``), published by the engine
+#: layer through ``install_ops(engine_factories=...)``.  Kept here rather than inside one family
+#: module because the seam is generic: any family may declare a factory slot, and the engine must not
+#: have to know which family did.
+_ENGINE_FACTORIES: Dict[str, Any] = {}
+
+
+def set_engine_factories(factories: Any) -> None:
+    """Publish (or clear, with ``{}``) the engine-side implementations, by semantic name."""
+    _ENGINE_FACTORIES.clear()
+    _ENGINE_FACTORIES.update(dict(factories))
+
+
+def engine_factories() -> Dict[str, Any]:
+    """A copy of what the engine published; empty when nothing did."""
+    return dict(_ENGINE_FACTORIES)
 
 
 # The one family shipped today.  Imported (not lazily discovered) because its name contains a dash

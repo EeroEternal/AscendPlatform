@@ -34,7 +34,6 @@ __all__ = [
     "ENGINE_FREE",
     "FORBIDDEN_IN_ENGINE_FREE",
     "FUNCTION_ONLY_IMPORTS",
-    "OPERATOR_ROOTS",
     "PORT_MODULE",
     "allowed",
     "describe",
@@ -87,7 +86,10 @@ FORBIDDEN_IN_ENGINE_FREE: Tuple[str, ...] = (
 FUNCTION_ONLY_IMPORTS: Tuple[str, ...] = ("torch_npu",)
 
 #: Roots reached only through :data:`PORT_MODULE`.
-OPERATOR_ROOTS: Tuple[str, ...] = ("tileinfer", "ascend_attention")
+#: The operator-package roots are **not** duplicated here: ``contracts/ports.py::OPERATOR_ROOTS``
+#: is the single source, because that is the side whose ``_candidates()`` consumes the *order*
+#: (first importable root wins).  The ACL test reads it from there; a second copy with the roots
+#: reversed sat here for a while and no test could tell the two apart.
 
 #: The single module allowed to import an operator package.
 PORT_MODULE: str = "ascend_platform.contracts.ports"

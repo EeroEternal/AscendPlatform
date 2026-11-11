@@ -107,6 +107,31 @@ check_compatibility(manifest, platform_version=__version__, device=device_profil
 
 平台侧不需要知道清单在哪个文件里——`load_manifest(path)` 接受路径，`doctor` 打印检查结果。
 
+## 5.1 算子仓怎么"报名"：`describe()` + entry point
+
+清单是数据，数据需要一个入口。算子包在**包根**暴露一个 `describe()`，返回的映射里除了上面的
+`library` / `ops`，还要给每个算子一个 `target`（`"包.模块:属性"`）——平台据此拿到可调用对象：
+
+```python
+# ascend_attention/__init__.py
+def describe():
+    return {"name": "ascend_attention", "version": "0.1.0",
+            "requires_platform": ">=0.1,<0.2",
+            "ops": {"moe.experts": {"target": "ascend_attention.ops.moe.compute:fused_experts"}}}
+```
+
+平台按两种顺序找它（[`contracts/provider.py`](../src/ascend_platform/contracts/provider.py)）：
+
+1. `ASCEND_PLATFORM_OPS` 指向的包——"我把平台指向了这个包"是明确指令，优先；
+2. `ascend_platform.providers` entry point 组——已安装的发行版自己声明。
+
+**算子名是语义名**（`moe.experts`、`moe.routing_topk_softmax`），不是 `vllm._custom_ops.silu_and_mul`
+那种引擎符号：把引擎符号写进算子仓，等于让引擎版本决定算子的名字。引擎符号到语义名的映射属于
+本仓（`engine/`），`_LAYOUTS` 的路径只是**旧层兜底**，不是契约。
+
+坏描述符、版本区间不匹配、`target` import 不到——都只让**那一个算子**变成 `unbound` 并带上原因，
+启动继续；原因会出现在横幅、`doctor` 与 `install_ops().details[<op>]` 里。
+
 ## 6. 与端口的关系
 
 | 关心的事 | 用 manifest | 用端口（`contracts/ports.py`） |
