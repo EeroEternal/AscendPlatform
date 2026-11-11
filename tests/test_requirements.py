@@ -83,3 +83,83 @@ def test_each_declared_requirement_carries_a_reason(family):
         "a requirement without a 'why' is a number nobody can argue with; the next person to move "
         f"it needs the sentence: {without_reason}"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# The verdict turns into a boot decision (engine/plugin.py)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_complete_install_does_not_stop_the_boot():
+    from ascend_platform.engine.plugin import _enforce_requirements
+
+    _enforce_requirements({"servable": True, "missing_mandatory": [], "layer_present": True})
+
+
+def test_a_missing_mandatory_op_stops_the_boot_and_names_the_ways_out():
+    from ascend_platform.engine.plugin import OperatorRequirementsUnmet, _enforce_requirements
+
+    with pytest.raises(OperatorRequirementsUnmet) as excinfo:
+        _enforce_requirements(
+            {"servable": False, "missing_mandatory": ["moe.experts"], "layer_present": True}
+        )
+    message = str(excinfo.value)
+    for fragment in ("moe.experts", "ASCEND_PLATFORM_OPS", "doctor", "cannot run on Ascend"):
+        assert fragment in message, f"{fragment!r} missing from the refusal message"
+
+
+def test_no_operator_layer_at_all_boots_in_diagnostic_mode(caplog):
+    """``ASCEND_PLATFORM_OPS`` unset and nothing installed: boot so ``doctor`` can explain."""
+    from ascend_platform.engine.plugin import _enforce_requirements
+
+    with caplog.at_level("WARNING", logger="ascend_platform.engine.plugin"):
+        _enforce_requirements(
+            {"servable": False, "missing_mandatory": ["moe.experts"], "layer_present": False}
+        )
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("without an operator layer" in message for message in messages), messages
+
+
+def test_the_refusal_is_not_swallowed_by_the_blanket_handler(monkeypatch):
+    """``install()`` catches ``Exception`` for every other step - this one must escape it.
+
+    Without this test the ordering is invisible: the same code with the raise inside the ``try``
+    logs "install() failed; continuing" and returns ``False``, i.e. the platform boots and dies on
+    the first forward, which is the exact failure mode the verdict exists to prevent.
+    """
+    from ascend_platform.engine import plugin
+
+    class _Report:
+        def summary(self) -> str:
+            return "patch registry: 1 applied"
+
+    monkeypatch.setattr(plugin, "_STATE", {"installed": False, "reason": "", "context": None})
+    monkeypatch.setattr(
+        plugin,
+        "_vllm_probe",
+        lambda: {"available": True, "version": "0.23.0", "supported": True, "detail": "vllm 0.23.0"},
+    )
+    monkeypatch.setattr(plugin, "_install_patches", lambda strict: _Report())
+    monkeypatch.setattr(plugin, "_install_backend", lambda: {"detail": "backend ok"})
+    monkeypatch.setattr(plugin, "_install_graph_bridge", lambda: {"detail": "graph ok"})
+    monkeypatch.setattr(
+        plugin,
+        "_install_ops",
+        lambda: {
+            "detail": "ops: 0 bound",
+            "servable": False,
+            "missing_mandatory": ["gdn.chunk_gated_delta_rule"],
+            "layer_present": True,
+            "bound": [],
+            "unbound": [],
+            "disabled": [],
+        },
+    )
+    monkeypatch.setattr(plugin, "_install_models", lambda: {"detail": "models ok"})
+
+    with pytest.raises(plugin.OperatorRequirementsUnmet):
+        plugin.install()
+    assert plugin._STATE["installed"] is False, (
+        "a process that refused to boot must not cache itself as installed, or a retry after "
+        "fixing the layer becomes a no-op"
+    )

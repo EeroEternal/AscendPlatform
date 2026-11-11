@@ -529,6 +529,10 @@ def _install_ops() -> Dict[str, Any]:
         "unbound": [],
         "disabled": [],
         "detail": "install_ops() did not run",
+        "servable": True,
+        "missing_mandatory": [],
+        "missing_optional": [],
+        "layer_present": False,
     }
     try:
         from ascend_platform.ops.install import install_ops
@@ -543,6 +547,13 @@ def _install_ops() -> Dict[str, Any]:
         unbound=list(report.unbound),
         disabled=list(report.disabled),
         detail=report.summary(),
+        # The verdict travels with the counts: "11 bound" and "cannot serve" are different states
+        # and the caller (``install``, ``status``, tests) must not have to re-derive which it is.
+        servable=bool(report.servable),
+        missing_mandatory=list(report.missing_mandatory),
+        missing_optional=list(report.missing_optional),
+        # "diagnostic mode": nothing bound because no operator layer was reachable at all.
+        layer_present=not report.layer_error and bool(report.operator_version or report.bound),
     )
     for op in report.unbound:
         logger.warning(
@@ -647,6 +658,52 @@ def _install_models() -> Dict[str, Any]:
     return info
 
 
+class OperatorRequirementsUnmet(RuntimeError):
+    """An enabled family is missing a **mandatory** operator, so the model cannot run on Ascend.
+
+    Raised from :func:`install` and deliberately *not* swallowed by its blanket handler: every other
+    failure in this module degrades to "vLLM's own implementation is still in place", but there is no
+    such fallback for a routed-expert MoE or the GDN recurrence.  Continuing would run CUDA-shaped
+    kernels on an NPU or fail on the first forward with a stack that no longer names the port.
+    """
+
+
+def _enforce_requirements(info: Dict[str, Any]) -> None:
+    """Turn ``install_ops``' verdict into a boot decision.
+
+    Two modes, and the difference matters:
+
+    * an **operator layer was reachable** and a mandatory op did not bind - that is a broken
+      installation of a layer we were told to use, so the boot stops here;
+    * **no layer at all** - the documented diagnostic mode (``ASCEND_PLATFORM_OPS`` unset, nothing
+      installed).  It boots so ``doctor`` can report what is missing; the first forward is where it
+      fails, which is the behaviour the README describes.
+    """
+    if info.get("servable", True):
+        return
+    missing = list(info.get("missing_mandatory") or ())
+    if not missing:
+        return
+    if not info.get("layer_present"):
+        logger.warning(
+            "ascend-platform ops: booting without an operator layer - the first forward will fail "
+            "rather than run on the wrong implementation (missing mandatory: %s). "
+            "`ascend-platform doctor` reports the candidates; set ASCEND_PLATFORM_OPS to pick one.",
+            ", ".join(missing),
+        )
+        return
+    raise OperatorRequirementsUnmet(
+        "ascend-platform: the enabled operator families are missing mandatory operators "
+        f"({', '.join(missing)}), so this model cannot run on Ascend. "
+        "Nothing was silently substituted: vLLM's own implementations for these names are CUDA "
+        "kernels, and running them here fails on the first forward with an unrelated stack. "
+        "Options: (a) install/point at an operator layer that serves them "
+        "(ASCEND_PLATFORM_OPS=<package>, the package must expose describe()); "
+        "(b) turn the family off if this model does not need it (ASCEND_PLATFORM_OPS=gdn); "
+        "(c) run `ascend-platform doctor` for the per-operator reason."
+    )
+
+
 # =============================================================================================
 # The entry point
 # =============================================================================================
@@ -700,6 +757,9 @@ def install(*, strict: Optional[bool] = None) -> bool:
             backend = _install_backend()
             graph = _install_graph_bridge()
             ops = _install_ops()
+            # Before the model registry and before ``_STATE`` says "installed": a process that
+            # cannot serve must not look booted.  This raise is re-raised below, not swallowed.
+            _enforce_requirements(ops)
             models = _install_models()
             _STATE.update(
                 installed=True,
@@ -723,6 +783,13 @@ def install(*, strict: Optional[bool] = None) -> bool:
                 models["detail"],
             )
             return True
+        except OperatorRequirementsUnmet as exc:
+            # The one failure that stops the boot.  ``_STATE`` is left un-installed so a retry after
+            # fixing the layer is a real retry rather than a cached "already installed" no-op.
+            _STATE["installed"] = False
+            _STATE["reason"] = "mandatory operator requirements unmet"
+            logger.error("ascend-platform vLLM plugin: %s", exc)
+            raise
         except Exception:  # noqa: BLE001 - the last resort: never raise out of a general plugin
             logger.exception(
                 "ascend-platform vLLM plugin: install() failed; continuing without it - the engine must "

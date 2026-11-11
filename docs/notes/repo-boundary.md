@@ -96,6 +96,18 @@ UNBOUND chunk_local_cumsum  :: declined - not a drop-in（刻意拒绝，FLA 的
 | P0 | 未实现清单前置到 README，避免集成方按"应该支持"写代码（本轮已改） | 算子仓 `README.md` |
 | P1 | 删掉 `vllm_adapter` 待办，改记为"由平台 `engine/abi/` 承担" | 算子仓 `docs/completion-audit.md` |
 
+## 4.1 判决如何落地（`OpsReport.servable`）
+
+| 情形 | 行为 |
+|---|---|
+| 强制算子齐全 | 正常启动；`servable=True`，`summary()` 无判决段 |
+| 给了算子层、缺强制算子 | `plugin.install()` 抛 `OperatorRequirementsUnmet`，**拒绝启动**，消息里给三条出路（换/装算子层、关掉该族、跑 doctor）；`_STATE` 不置 installed，修好后重试是真重试 |
+| 没给算子层 | "诊断模式"：启动 + 警告 + `doctor` 详列缺什么；第一次前向失败（无厂商回退） |
+| 只缺可选算子 | 正常启动，`missing_optional` 里点名（如 `gdn.chunk_local_cumsum`） |
+
+`tests/test_requirements.py` 四条测试钉住这四种情形，其中一条专门钉"这个异常**没有**被 `install()` 的
+兜底 `except Exception` 吞掉"——那种写法会把拒绝变成"装失败但继续跑"，正好是本判决要防的事。
+
 ## 5. 目标契约（尚未实现，别按文档假定已存在）
 
 三件东西，缺一不可：

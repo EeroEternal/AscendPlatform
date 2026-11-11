@@ -58,8 +58,10 @@
 **逐项生效，不搞全有全无**：每个算子有四种状态——`bound` / `unbound(原因)` / `declined(原因)` /
 `disabled(开关)`；缺一个只影响它自己。**强制/可选分开**（`ops/requirements.py`）：可选算子缺失
 （如 `gdn.chunk_local_cumsum`，我们刻意拒绝）照常服务；**强制**算子缺失时 `install_ops()` 记
-`report.servable = False`，日志打 `CANNOT SERVE`，`doctor` 那一条变 FAIL——**不静默跑错**。
-（让引擎在启动阶段直接拒绝，需要 worker 侧读这个标志，属未做项。）
+`report.servable = False`，日志打 `CANNOT SERVE`，`doctor` 那一条变 FAIL，并且——**只要你给了算子层**——
+`plugin.install()` 抛 `OperatorRequirementsUnmet` 直接拒绝启动（没给算子层时按"诊断模式"启动，让 `doctor`
+能报缺什么）。这一条**不受别的异常处理兜底**：其余失败都退化成"vLLM 自己的实现还在"，而强制算子没有
+可退化的实现——继续跑只会在第一次前向炸在一个不相关的堆栈里。
 
 **现状（别按文档假定已实现）**：两块都通了，但都不是终态：
 

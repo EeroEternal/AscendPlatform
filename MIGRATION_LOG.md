@@ -480,6 +480,11 @@ vLLM 0.23.0 | strict=False | patches: 3 applied, 0 skipped (target gone), 0 fail
 | 逐项绑定 + provider 发现 | 10 bound / 2 unbound / 1 off |
 | 再加 `engine/abi`（符号表 + MoE 类工厂） | **11 bound / 1 unbound / 1 off** |
 
+再下一步：**判决变成启动决定**。`plugin.install()` 在 `_install_ops()` 之后调 `_enforce_requirements()`：
+给了算子层却缺强制算子 → 抛 `OperatorRequirementsUnmet`，**拒绝启动**（这是唯一允许穿过兜底 `except
+Exception` 的异常，其余失败仍退化成"vLLM 自己的实现还在"）；没给算子层 → 诊断模式照常启动，让 `doctor`
+报缺什么。四条测试钉住，其中一条专门钉"没被兜底吞掉"。
+
 再下一步：**强制/可选分开**（`ops/requirements.py`）。原来"10 bound"是个数字，没有判决——一个我们
 刻意 decline 的算子（`chunk_local_cumsum`）和一个真正缺的强制算子（`engine.moe_method`）在报告里长得
 一模一样。现在每条要求带 `mandatory` 与理由，`report.servable` 给出结论，`doctor` 那一条按它 FAIL：
@@ -507,6 +512,35 @@ ops: 10 bound, 2 unbound ... | CANNOT SERVE: missing mandatory engine.moe_method
 （`contracts/vocabulary.py`）给这条路径加了类别检查：一个 `kind="compute"` 的实现**不能**被绑到
 `class_factory` 槽上——那正是这一轮发现的真实陷阱（算子仓给 `unquantized_fused_moe` 发了个别名，
 指向纯 compute；照绑会在模型加载时才炸）。
+
+### 4.14 真机第一次验证：MoE 计算算子与平台类工厂（Ascend950PR，共卡环境）
+
+这台机器**有** NPU（`Ascend950PR_9579`，CANN 9.3.0）。之前我把"同事正在跑推理、不能影响别人"错说成
+"这台机器没有 NPU"，这是错的：可以验证，只是不能起服务、不能抢显存。做法是几 MB 的小张量、不加载模型、
+不启动引擎进程，跑完即退（HBM 可用量 125392 MB → 125298 MB，进程退出即释放；同事的
+`dsv4-generate` 进程内存 50854 MB 全程未变）。
+
+验证结果（算子仓 `ops/moe/compute.py`，平台侧 `engine/abi` 的类工厂在 CPU 上验证形状）：
+
+| 项 | 结果 |
+|---|---|
+| `topk_softmax` 的 ids | 与 `torch.topk(softmax)` **逐位相同**（fp16/bf16） |
+| `topk_softmax` 的权重 | 与"重归一化后的 top-k 权重"一致（max err 4e-4）；**不**与未重归一化的比较——默认 `renormalize=True`，我第一次的比较基线错了 |
+| `fused_experts` vs 算子仓自己的 `fused_experts_reference` | 相对误差 fp16 1.4e-3 / bf16 8.2e-3，无 NaN |
+| `silu_and_mul` | 相对误差 5.6e-4 |
+| `moe_align_block_size`（形状与 sentinel 尾巴） | 与手算一致（`sorted_ids` 长度 56、`expert_ids` 14 块） |
+
+同时**用算子仓自己的 `CaptureGuard` 在真机上证伪了两条 `capture_safe` 声明**（已写进给算子仓的问题单）：
+
+1. `moe_align_block_size`：`compute.py` 里 `expert_ids[: padded.sum() // block_size]` 把 0 维设备张量当
+   切片上界 → `syncs=1: aten::_local_scalar_dense(<torch.int64 () on npu>)`，与它 docstring 写的
+   "never reads it on the host … does not sync" 直接矛盾。**已验证的改法**：先
+   `per_block = torch.repeat_interleave(arange(E), padded // block_size)`，再
+   `expert_ids[: per_block.numel()] = per_block`（`numel()` 是形状元数据，不解引用数据）→ 同样输出、
+   `syncs=0`。
+2. `fused_experts`：`compute.py:337` 每个专家一次 `torch.nonzero`（数据相关形状，捕获期不可用），而
+   `capture.py` 的 `SYNC_OPS` 里没有 `aten::nonzero` / `aten::unique`，所以 guard 报 `syncs=0` ——
+   **假阴性**。两条都应落在 `eager_only`，或先把 `nonzero` 补进 `SYNC_OPS` 再看真实等级。
 
 ## 5. 新增的测试（不是在搬运）
 
