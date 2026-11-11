@@ -590,6 +590,11 @@ def _resolvable(target: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def _injected(binding: OpBinding) -> Optional[Callable[..., Any]]:
+    """The engine-built adapter for ``binding``, when the engine layer published one."""
+    return _ENGINE_IMPLS.get(getattr(binding, "platform_name", "") or "")
+
+
 def _installed_impl(binding: OpBinding) -> Optional[Callable[..., Any]]:
     """The callable a patch installs for ``binding``.
 
@@ -600,6 +605,9 @@ def _installed_impl(binding: OpBinding) -> Optional[Callable[..., Any]]:
     its ``impl`` is a class factory (``impl(base_cls) -> subclass``), not a per-call function, so
     there is no call shape for a candidate predicate to dispatch on.
     """
+    injected = _injected(binding)
+    if injected is not None:
+        return injected
     if binding.candidates is None:
         return binding.impl
     return binding.candidates.dispatched()
@@ -652,7 +660,7 @@ def _plan(binding: OpBinding, report: OpsReport, registered: List[str]) -> str:
             f"unbound: {binding.abi_note} (vLLM name: {binding.targets[0]})"
         )
         return "unbound"
-    if binding.impl is None:
+    if binding.impl is None and _injected(binding) is None:
         report.details[binding.op] = (
             f"unbound: {binding.impl_note}"
             if binding.impl_note
@@ -786,9 +794,25 @@ def _targets_of(binding: "OpBinding") -> Tuple[Tuple[str, ...], str]:
     return (published,) + tuple(binding.targets[1:]), ""
 
 
+_ENGINE_IMPLS: Dict[str, Callable[..., Any]] = {}
+
+
+def set_engine_impls(impls: Optional[Mapping[str, Callable[..., Any]]]) -> None:
+    """Publish (or clear, with ``None``) callables the engine layer built for its own calling shape."""
+    _ENGINE_IMPLS.clear()
+    if impls:
+        _ENGINE_IMPLS.update(impls)
+
+
+def engine_impl_map() -> Dict[str, Callable[..., Any]]:
+    """A copy of the published callables; empty when the engine layer published none."""
+    return dict(_ENGINE_IMPLS)
+
+
 def install_ops(
     engine_factories: Optional[Mapping[str, Callable[[type], type]]] = None,
     engine_symbols: Optional[Mapping[str, str]] = None,
+    engine_impls: Optional[Mapping[str, Callable[..., Any]]] = None,
 ) -> OpsReport:
     """Wire every family the active model profile names into vLLM's dispatch; never raises.
 
@@ -798,6 +822,14 @@ def install_ops(
     import ``engine/abi``, and ``engine/abi`` must not import an operator package.  Keys are semantic
     names from ``contracts/vocabulary.py`` (today: ``engine.moe_method``); the plugin passes
     ``{"engine.moe_method": vllm_0_23.moe_method_factory(compute)}``.
+
+    ``engine_impls`` is the third shape: a semantic name whose **vLLM calling convention** differs from
+    the operator's (``vllm._custom_ops.topk_softmax`` writes into caller-allocated buffers and returns
+    ``None``; a functional ``topk_softmax(scores, top_k)`` returns a pair).  The engine layer owns that
+    mismatch - it is a fact about vLLM, not about the operator - so it publishes an adapter here and the
+    adapter is what gets bound, in place of the operator's bare function.  An entry wins over the
+    family's own ``impl`` because binding the raw function to that path is a ``TypeError`` on the first
+    call, not a slower path.
 
     ``engine_symbols`` is the same seam for *paths*: ``engine/abi/vllm_0_23.ENGINE_SYMBOL`` maps a
     record's ``platform_name`` to what this vLLM release ships.  When published it is authoritative,
@@ -812,6 +844,8 @@ def install_ops(
         families_module.set_engine_factories(engine_factories)
     if engine_symbols is not None:
         set_engine_symbols(engine_symbols)
+    if engine_impls is not None:
+        set_engine_impls(engine_impls)
     with _LOCK:
         cached = _STATE.get("report")
         if _STATE.get("installed") and isinstance(cached, OpsReport):

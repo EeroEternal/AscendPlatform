@@ -50,12 +50,146 @@ logger = logging.getLogger("ascend_platform.engine.abi.vllm_0_23")
 __all__ = [
     "ENGINE_SYMBOL",
     "NO_ENGINE_SYMBOL",
+    "INPLACE_ENGINE_SYMBOL",
     "MOE_METHOD_TARGETS",
+    "inplace_adapters",
+    "topk_softmax_inplace",
+    "moe_align_block_size_inplace",
+    "silu_and_mul_inplace",
     "OOT_CLASS_NAME",
     "target_for",
     "moe_method_factory",
     "moe_method_targets",
 ]
+
+
+#: Engine symbols whose vLLM form is **in place into preallocated buffers**.
+#:
+#: ``vllm._custom_ops`` is a thin wrapper over the C++ ``torch.ops._moe_C`` entry points, and those
+#: write into tensors the *caller* allocated - ``topk_softmax(topk_weights, topk_ids,
+#: token_expert_indices, gating_output, renormalize) -> None`` (``_custom_ops.py:2494-2510``) and
+#: ``moe_align_block_size(topk_ids, num_experts, block_size, sorted_token_ids, experts_ids,
+#: num_tokens_post_pad, expert_map=None) -> None`` (``:2346-2363``).
+#:
+#: ``moe.swiglu_gate`` is **not** here: vLLM 0.23 ships no ``_custom_ops.silu_and_mul`` (only the
+#: quantized variants), the plain op is ``torch.ops._C.silu_and_mul`` reached from
+#: ``SiluAndMul.forward_cuda``, and on an OOT platform ``forward_native`` is pure torch - so there is
+#: no module attribute to bind (see ``NO_ENGINE_SYMBOL``).  :func:`silu_and_mul_inplace` stays for the
+#: release that does expose the wrapper.
+#:
+#: An operator library that publishes *functional* ops - ``topk_softmax(scores, top_k) ->
+#: (weights, ids)`` - cannot be bound to those paths directly: the call raises ``TypeError`` on the
+#: first routing step, or worse, silently fills nothing.  The adaptation is engine knowledge (which
+#: buffer is which, what the caller sized it to), so it lives here; the math stays with the operator.
+INPLACE_ENGINE_SYMBOL: Dict[str, str] = {
+    "moe.routing_topk_softmax": "vllm._custom_ops.topk_softmax",
+    "moe.align_block_size": "vllm._custom_ops.moe_align_block_size",
+}
+
+
+def topk_softmax_inplace(compute: Callable[..., Any]) -> Callable[..., None]:
+    """Adapt a functional ``topk_softmax(scores, top_k)`` to vLLM's in-place protocol.
+
+    The caller (``router/fused_topk_router.py:69-105``) allocates ``topk_weights`` **float32**,
+    ``topk_ids`` (int32 or the expert-map index dtype) and ``token_expert_indices``, then ignores the
+    third tensor downstream (``_compute_routing`` returns only weights and ids).  ``top_k`` is not an
+    argument of the engine op - it is the width the caller allocated - so it is read from the buffer,
+    not guessed.
+    """
+
+    def adapter(
+        topk_weights: Any,
+        topk_ids: Any,
+        token_expert_indices: Any,
+        gating_output: Any,
+        renormalize: bool = False,
+        e_score_correction_bias: Any = None,
+    ) -> None:
+        if e_score_correction_bias is not None:
+            # Grouped routing with a correction bias is DeepSeek-style; the functional op does not
+            # take one, and ignoring it would pick the wrong experts - a silent accuracy bug, so
+            # refuse loudly instead.
+            raise NotImplementedError(
+                "ascend-platform: this operator layer's topk_softmax does not implement "
+                "e_score_correction_bias (grouped routing); the model that needs it "
+                "(DeepSeek-style routing) cannot run on this layer yet"
+            )
+        top_k = int(topk_weights.shape[-1])
+        weights, ids = compute(gating_output, top_k, renormalize=bool(renormalize))
+        # ``copy_`` is the cast: the engine's weights buffer is float32, the operator may return the
+        # logits' dtype (bf16).  Writing through the caller's buffers is the point of the in-place
+        # convention - allocating here would break capture/compile aliasing.
+        topk_weights.copy_(weights)
+        topk_ids.copy_(ids)
+        token_expert_indices.copy_(ids)
+
+    return adapter
+
+
+def moe_align_block_size_inplace(compute: Callable[..., Any]) -> Callable[..., None]:
+    """Adapt a functional ``moe_align_block_size(topk_ids, num_experts, block_size) -> (ids, experts, n)``.
+
+    The caller sizes its buffers for the *maximum* (``moe_align_block_size.py:76-92``), so the
+    operator's prefix is copied and the unmatched tail is left at vLLM's sentinel (-1 for the expert
+    ids).  No host read of the device-side ``n``: it is copied into the caller's one-element buffer.
+    """
+
+    def adapter(
+        topk_ids: Any,
+        num_experts: int,
+        block_size: int,
+        sorted_token_ids: Any,
+        experts_ids: Any,
+        num_tokens_post_pad: Any,
+        expert_map: Any = None,
+    ) -> None:
+        if expert_map is not None:
+            raise NotImplementedError(
+                "ascend-platform: expert-parallel routing (expert_map != None) is not implemented "
+                "by this operator layer's align op; single-node serving passes None"
+            )
+        ids, experts, used = compute(
+            topk_ids,
+            int(num_experts),
+            int(block_size),
+            num_tokens=int(topk_ids.shape[0]),
+        )
+        take = min(int(ids.shape[0]), int(sorted_token_ids.shape[0]))
+        sorted_token_ids[:take] = ids[:take]
+        keep = min(int(experts.shape[0]), int(experts_ids.shape[0]))
+        experts_ids[:keep] = experts[:keep]
+        if keep < int(experts_ids.shape[0]):
+            experts_ids[keep:] = -1
+        num_tokens_post_pad.copy_(used)
+
+    return adapter
+
+
+def silu_and_mul_inplace(compute: Callable[..., Any]) -> Callable[..., None]:
+    """Adapt a functional ``silu_and_mul(x) -> tensor`` to vLLM's ``silu_and_mul(out, x)``."""
+
+    def adapter(out: Any, x: Any) -> None:
+        out.copy_(compute(x))
+
+    return adapter
+
+
+def inplace_adapters(compute: Mapping[str, Callable[..., Any]]) -> Dict[str, Callable[..., None]]:
+    """Build every in-place adapter whose functional op is in ``compute`` (semantic name -> callable).
+
+    Only semantics the operator layer actually serves appear, so a missing op stays "unbound with a
+    reason" rather than becoming a proxy that raises on the first call.
+    """
+    builders: Dict[str, Callable[[Callable[..., Any]], Callable[..., None]]] = {
+        "moe.routing_topk_softmax": topk_softmax_inplace,
+        "moe.align_block_size": moe_align_block_size_inplace,
+        "moe.swiglu_gate": silu_and_mul_inplace,
+    }
+    return {
+        name: builders[name](compute[name])
+        for name in builders
+        if callable(compute.get(name))
+    }
 
 
 #: Semantic name -> the path vLLM 0.23 ships for it.  ``None`` means "the engine has no symbol for
@@ -64,7 +198,6 @@ ENGINE_SYMBOL: Mapping[str, str] = {
     # MoE
     "moe.routing_topk_softmax": "vllm._custom_ops.topk_softmax",
     "moe.align_block_size": "vllm._custom_ops.moe_align_block_size",
-    "moe.swiglu_gate": "vllm._custom_ops.silu_and_mul",
     "moe.experts": "vllm.model_executor.layers.fused_moe.fused_moe.fused_experts",
     # GDN / linear attention (the FLA set vLLM 0.23 vendors)
     "gdn.chunk_gated_delta_rule": (
@@ -100,6 +233,11 @@ NO_ENGINE_SYMBOL: Tuple[str, ...] = (
     "moe.experts_unquantized",
     "moe.slot_layout",
     "moe.prenz_pack",
+    # vLLM 0.23 has no ``_custom_ops.silu_and_mul`` wrapper: the plain op is
+    # ``torch.ops._C.silu_and_mul``, called only from ``SiluAndMul.forward_cuda``.  On an OOT platform
+    # that class uses ``forward_native`` (pure torch ``F.silu``), so there is nothing to rebind and
+    # binding the missing attribute would report a drift that is really a version fact.
+    "moe.swiglu_gate",
     "attention.paged_prefill",
     "sampling.topk_threshold",
     "sampling.greedy",

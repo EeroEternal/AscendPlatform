@@ -515,6 +515,34 @@ def _install_graph_bridge() -> Dict[str, Any]:
 # =============================================================================================
 
 
+def _engine_impls() -> Dict[str, Any]:
+    """Adapters for the vLLM symbols whose calling convention is not the operator's.
+
+    Empty when the operator layer does not serve the functional op behind a symbol: the binding then
+    stays unbound with a reason instead of binding something that raises on the first call.  Reading
+    the provider here (rather than in ``ops/``) keeps the dependency direction: this is the only layer
+    allowed to know both the operator's names and vLLM's calling shapes.
+    """
+    from ascend_platform.contracts.provider import provider
+    from ascend_platform.engine.abi import vllm_0_23
+
+    serving = provider()
+    if serving is None:
+        return {}
+    functional: Dict[str, Any] = {}
+    for semantic in vllm_0_23.INPLACE_ENGINE_SYMBOL:
+        impl, why = serving.load(semantic)
+        if impl is None:
+            logger.info(
+                "ascend-platform ops: %s stays unbound - no functional implementation published (%s)",
+                semantic,
+                why,
+            )
+            continue
+        functional[semantic] = impl
+    return vllm_0_23.inplace_adapters(functional)
+
+
 def _install_ops() -> Dict[str, Any]:
     """Hand the target model's operators to :mod:`ascend_platform.ops.install`.
 
@@ -579,6 +607,10 @@ def engine_install_kwargs() -> Dict[str, Any]:
         # The vLLM 0.23 symbol table: the engine layer is the authority on what this release ships,
         # so the family table's own targets are checked against it at plan time.
         "engine_symbols": vllm_0_23.ENGINE_SYMBOL,
+        # Symbols whose vLLM form is in-place into caller-allocated buffers.  The operator layer's
+        # functional op is not callable through that protocol, so the adapter built here is what gets
+        # bound; see ``engine/abi/vllm_0_23.INPLACE_ENGINE_SYMBOL``.
+        "engine_impls": _engine_impls(),
     }
 
 

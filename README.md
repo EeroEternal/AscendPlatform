@@ -80,15 +80,21 @@
 实测（真 vLLM 0.23 符号 + 拆分后的算子仓）：**13 个必需算子 → 11 bound / 1 declined / 1 off by switch**。
 
 用户自带算子走同一条路：任何实现了上面三件的包都可以被 `ASCEND_PLATFORM_OPS=<name>` 选中，
-本仓不区分"官方算子仓"与"用户算子包"。
+本仓不区分"官方算子仓"与"用户算子包"。自动发现只认**一个**根（`ascend_attention`），因为支持的
+依赖方向是 `vllm` + 本仓 + `AscendAttention`；别的包（包括迁移源 TileInfer）都必须显式指定。
+
+vLLM 的 `_custom_ops` 里有几个符号是**写进调用方预分配缓冲区**的（`topk_softmax`、
+`moe_align_block_size`），而算子仓发布的是函数式实现。这种"调用约定"差异由本仓的
+`engine/abi/vllm_0_23.py::inplace_adapters()` 抹平——它是引擎知识，不是算子数学，所以由平台承担，
+算子仓继续发函数式算子。
 
 ## 支持的组合
 
 | 组合 | 状态 |
 |---|---|
-| 本仓平台 + AscendAttention | ⚠️ 绑定层已通（13 个必需算子 11 bound / 1 declined / 1 开关关闭）；**端到端推理未验证** |
-| 本仓平台 + TileInfer（迁移源） | ✅ 已在单卡跑通：16 token 的 logprobs 与源仓逐位一致（`MIGRATION_LOG.md` §6） |
-| 本仓平台 + 用户自研算子包 | ✅ 契约可用：包根暴露 `describe()` 即可被选中；未做 end-to-end 验证 |
+| 本仓平台 + AscendAttention | ⚠️ 绑定层已通（13 个必需算子 11 bound / 1 declined / 1 开关关闭），MoE 的 in-place 调用约定已适配并在真机协议下验证；**端到端推理未验证**，欠什么见 [`docs/notes/qwen36-e2e-gaps.md`](docs/notes/qwen36-e2e-gaps.md) |
+| 本仓平台 + 用户自研算子包 | ✅ 契约可用：包根暴露 `describe()` 即可被选中；⚠️ Qwen3.6 的 GDN 部分目前只能由平台内置布局表绑定，因为 AscendAttention 尚未声明那 7 个名字（同上文档 §1） |
+| 本仓平台 + TileInfer（迁移源，**仅验证用**） | ✅ 曾在单卡跑通：16 token 的 logprobs 与源仓逐位一致（`MIGRATION_LOG.md` §6）。**不是依赖**：它不在自动发现里，只能 `ASCEND_PLATFORM_OPS=tileinfer` 显式指定，用来验证"用户自带算子包"这条路 |
 | 本仓平台 + 无算子层 | ⚠️ 能启动、能自检、能报缺什么；**第一次前向失败**（无厂商回退） |
 | 厂商平台 + 厂商算子（`vllm_ascend`） | 基线，用于对照；与本仓**不可同装**（vLLM 只允许一个平台插件） |
 

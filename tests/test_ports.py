@@ -114,7 +114,10 @@ def test_the_pinned_layer_is_the_only_candidate(monkeypatch):
 
 
 def test_the_default_candidates_prefer_the_target_layer():
-    assert OPERATOR_ROOTS == ("ascend_attention", "tileinfer")
+    assert OPERATOR_ROOTS == ("ascend_attention",), (
+        "the supported flow is vLLM + AscendPlatform + AscendAttention; another root may only be "
+        "used when it is pinned explicitly, so it must not appear here"
+    )
 
 
 def test_an_absent_layer_raises_with_the_install_hint(monkeypatch):

@@ -289,3 +289,62 @@ def test_a_matching_version_is_recorded_in_the_report():
     assert report.layer_error == ""
     assert report.operator_version, "the version verified at start-up belongs in the report"
     assert report.bound, "a healthy layer binds something"
+
+
+def test_an_engine_built_adapter_is_what_gets_bound(monkeypatch):
+    """``engine_impls`` wins over the family's own function: the engine's call shape is not negotiable.
+
+    The record's ``impl`` is the operator layer's *functional* op; vLLM's symbol writes into caller
+    buffers.  Binding the functional op is a ``TypeError`` on the first routing step, so the adapter
+    the engine layer publishes must be the callable the patch installs.
+    """
+    from ascend_platform.ops import install as install_mod
+
+    seen = {}
+
+    def engine_side_only(topk_weights, topk_ids, token_expert_indices, gating_output, renormalize=False):
+        seen["called"] = True
+
+    def operator_side(scores, top_k, *, renormalize=True):
+        raise AssertionError("the operator's functional op must not be bound to vLLM's in-place path")
+
+    record = install_mod.OpBinding(
+        op="topk_softmax",
+        family="moe",
+        platform_name="moe.routing_topk_softmax",
+        targets=("vllm._custom_ops.topk_softmax",),
+        impl=operator_side,
+        why="test",
+        remove_when="test",
+    )
+    assert install_mod._installed_impl(record) is operator_side
+
+    install_mod.set_engine_impls({"moe.routing_topk_softmax": engine_side_only})
+    try:
+        assert install_mod._installed_impl(record) is engine_side_only
+    finally:
+        install_mod.set_engine_impls(None)
+    assert install_mod.engine_impl_map() == {}
+    assert install_mod._installed_impl(record) is operator_side
+
+
+def test_an_injected_adapter_satisfies_a_record_with_no_impl_of_its_own():
+    """A semantic the family table has no function for can still bind through the engine adapter."""
+    from ascend_platform.ops import install as install_mod
+
+    record = install_mod.OpBinding(
+        op="topk_softmax",
+        family="moe",
+        platform_name="moe.routing_topk_softmax",
+        targets=("vllm._custom_ops.topk_softmax",),
+        impl=None,
+        impl_note="no functional op published",
+        why="test",
+        remove_when="test",
+    )
+    install_mod.set_engine_impls({"moe.routing_topk_softmax": lambda *a, **k: None})
+    try:
+        assert install_mod._injected(record) is not None
+    finally:
+        install_mod.set_engine_impls(None)
+    assert install_mod._injected(record) is None

@@ -71,7 +71,7 @@ docs/                  hardware-checklist hardware-facts + 4 篇设计文档 + �
 不可读，也会让 `reference/` 里的引用对不上。改名是一次独立的、机械的、可验证的提交，
 放在测试全绿之后。
 
-## 2.1 完整性审计：定义级 401/415 + 模块级 510/521 + 装饰器 456/456 + 调用级 1045
+## 2.1 完整性审计：定义级 400/415 + 模块级 510/521 + 装饰器 456/456 + 调用级 1045
 
 "一行不落地搬过来"是可证伪的说法，所以它被写成了三层测试
 （[`tests/test_migration_parity.py`](tests/test_migration_parity.py)；源仓库不在时整文件跳过）。
@@ -541,6 +541,40 @@ ops: 10 bound, 2 unbound ... | CANNOT SERVE: missing mandatory engine.moe_method
 2. `fused_experts`：`compute.py:337` 每个专家一次 `torch.nonzero`（数据相关形状，捕获期不可用），而
    `capture.py` 的 `SYNC_OPS` 里没有 `aten::nonzero` / `aten::unique`，所以 guard 报 `syncs=0` ——
    **假阴性**。两条都应落在 `eager_only`，或先把 `nonzero` 补进 `SYNC_OPS` 再看真实等级。
+
+### 4.15 依赖收敛到 vllm + 本仓 + AscendAttention，以及 Qwen3.6 端到端欠什么
+
+**口径**：支持的依赖方向只有 `vllm 0.23` + `AscendPlatform` + `AscendAttention`。迁移源 TileInfer
+不是依赖，它现在的角色是"一个用户自研算子包"的样例，只在验证多路径时**显式**指定。
+
+于是两处行为改了：
+
+1. `contracts/ports.OPERATOR_ROOTS` 从 `("ascend_attention", "tileinfer")` 收成
+   `("ascend_attention",)`。原来"装了就优先"会让一台碰巧装了 TileInfer 的机器悄悄绕过受支持的算子层；
+   现在别人的包（包括 TileInfer）只能 `ASCEND_PLATFORM_OPS=<包名>` 显式选中，`_LAYOUTS` 里它的条目
+   仍保留，用于这条显式路径。
+2. **调用约定差异归平台**。vLLM 的 `_custom_ops.topk_softmax`/`moe_align_block_size` 是写进调用方
+   预分配缓冲区的 C++ 包装（`_custom_ops.py:2494-2510`、`:2346-2363`），AscendAttention 发的是函数式
+   `topk_softmax(scores, top_k) -> (weights, ids)`。直接绑 = 第一次路由就 `TypeError`。新增
+   `engine/abi/vllm_0_23.inplace_adapters()` 生成适配器，`install_ops(engine_impls=...)` 把它作为实际
+   绑定的实现（`_installed_impl` 里新增一个前置分支）。真机协议下实测：ids 与 `torch.topk` 逐位相同，
+   权重与重归一化参考 fp32 完全一致 / bf16 3.8e-03，`moe_align_block_size` 的 pad 值 = `numel`
+   （vLLM 的 sentinel 约定）、未产出的 block 尾部写 `-1`。
+   顺带纠正一个 ABI 事实：vLLM 0.23 **没有** `_custom_ops.silu_and_mul`（只有量化变体），平坦版是
+   `torch.ops._C.silu_and_mul`、只被 `forward_cuda` 调用，OOT 走 `forward_native` → `moe.swiglu_gate`
+   移入 `NO_ENGINE_SYMBOL`，不再假装有个可绑的模块属性。
+
+**Qwen3.6 端到端欠什么**：单独一份 [`docs/notes/qwen36-e2e-gaps.md`](docs/notes/qwen36-e2e-gaps.md)。
+一句话结论：**算子数量够，但"算子层自己声明"没通**——13 个必需算子里 AscendAttention 只声明了 4 个
+（全是 MoE），7 个 GDN 名字加 `chunk_local_cumsum` 目前只靠平台内置的 `_LAYOUTS` 硬编码绑定。所以
+"用户自研算子包也能拉起平台"对 MoE 成立、对 GDN 不成立；差的是 AscendAttention 在 `describe()` 里
+补上那 8 个名字（指向它已有的 `ops/fla/*`、`ops/gdn/leaves.py`）。模型侧无缺口：架构
+`Qwen3_5MoeForConditionalGeneration` 在 vLLM 0.23 registry 里，检查点 bf16 无量化（正好走
+`UnquantizedFusedMoEMethod`），`attn_output_gate` 在模型代码里应用，MRoPE 走 `forward_native`。
+
+**运维事实**（实测）：同一 venv 同时装 `tileinfer` 和 `ascend_platform` 两个 platform plugin 时，
+`import vllm` 直接 `RuntimeError: Only one platform plugin can be activated`。目标链路必须
+`VLLM_PLUGINS=ascend_platform` 或卸载 tileinfer —— 这是"不把 TileInfer 当依赖"的运维理由，不只是洁癖。
 
 ## 5. 新增的测试（不是在搬运）
 

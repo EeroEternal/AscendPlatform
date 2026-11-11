@@ -67,6 +67,15 @@ PAIRS: Tuple[Tuple[str, str], ...] = (
 
 #: Bodies that differ, and why.  A new entry here is a decision; a new *difference* is a regression.
 EXPECTED_DIFFERENCES: Mapping[str, str] = {
+    "vllm/ops/install.py::_installed_impl": (
+        "one branch added ahead of the original two: an injected engine adapter wins over the "
+        "family's own impl.  vLLM's `_custom_ops.topk_softmax`/`moe_align_block_size` write into "
+        "caller-allocated buffers and return None (vllm/_custom_ops.py:2494-2510, :2346-2363), while "
+        "an operator library publishes the functional form; binding the functional form there is a "
+        "TypeError on the first routing step.  The adapter is engine knowledge (which buffer is "
+        "which), so `engine/abi` builds it and `install_ops(engine_impls=...)` hands it in; the rest "
+        "of the function - the candidate dispatcher and the plain impl - is unchanged"
+    ),
     "vllm/plugin.py::install": (
         "one call added at the top: _ensure_visible_logs() gives this package's logger a destination "
         "under `vllm serve`, where vLLM's dictConfig puts the only handler on the 'vllm' logger with "
@@ -648,8 +657,8 @@ def test_every_exclusion_gives_a_reason_a_reader_can_act_on(table: str) -> None:
 AUDIT_COUNTS = {
     "pairs": 31,
     "definitions": 415,
-    "definitions_identical": 401,
-    "definitions_explained": 14,
+    "definitions_identical": 400,
+    "definitions_explained": 15,
     "module_items": 521,
     "module_items_identical": 510,
     "module_items_explained": 11,

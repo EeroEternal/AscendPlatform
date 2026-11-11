@@ -48,15 +48,21 @@ __all__ = [
     "ops_module",
 ]
 
-#: Pin the operator layer explicitly (``tileinfer`` or ``ascend_attention``).
+#: Pin the operator layer explicitly (``ascend_attention``, or any package a user wrote).
 ENV_OPS_LAYER = "ASCEND_PLATFORM_OPS"
 
-#: Candidate roots, in preference order: the target layer first, the migration source second.
-#: The order **is** the policy - ``_candidates()`` returns this tuple when nothing is pinned, and
-#: the first root that imports wins.  This is the only declaration of the list; the ACL table used
-#: to carry a second copy (reversed, and order-insensitive where it was read), which is exactly the
-#: kind of duplicate that makes a reader believe there is a preference conflict where there is none.
-OPERATOR_ROOTS: Tuple[str, ...] = ("ascend_attention", "tileinfer")
+#: Candidate roots, in preference order; the order **is** the policy - ``_candidates()`` returns this
+#: tuple when nothing is pinned, and the first root that imports wins.  This is the only declaration
+#: of the list; the ACL table used to carry a second copy (reversed, and order-insensitive where it
+#: was read), which is exactly the kind of duplicate that makes a reader believe there is a
+#: preference conflict where there is none.
+#:
+#: One entry, because the supported dependency flow is ``vllm`` + ``AscendPlatform`` +
+#: ``AscendAttention``.  The migration source (``tileinfer``) is **not** a dependency: it can stand in
+#: for "a user's own operator package" by naming it explicitly, ``ASCEND_PLATFORM_OPS=tileinfer``, and
+#: a third-party package works the same way.  Auto-detecting it would make every machine that happens
+#: to have it installed silently prefer it over the supported layer.
+OPERATOR_ROOTS: Tuple[str, ...] = ("ascend_attention",)
 
 #: The logical modules the platform may ask for; a layout must name every one of them.
 _REQUIRED_LOGICAL: Tuple[str, ...] = (

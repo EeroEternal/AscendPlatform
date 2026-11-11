@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
+
+import pytest
+import torch
 import textwrap
 import types
 
@@ -69,9 +72,10 @@ def test_the_paths_match_what_the_family_table_binds_today():
                 f"{record.op}: abi={published!r} binding={record.targets[0]!r}"
             )
     assert not mismatches, mismatches
-    assert unchecked == ["engine.moe_method"], (
-        "exactly one record is a class-factory slot with no engine symbol; a different set means "
-        f"the table or the records moved: {unchecked}"
+    assert sorted(unchecked) == ["engine.moe_method", "moe.swiglu_gate"], (
+        "two records have no engine symbol on this release: the class-factory slot, and the "
+        "activation whose only vLLM 0.23 entry point is a C++ op the OOT path never calls; a "
+        f"different set means the table or the records moved: {sorted(unchecked)}"
     )
 
 
@@ -287,3 +291,140 @@ def test_the_vocabulary_declares_the_moe_method_slot_as_a_factory():
     """The kind check that refuses a compute function here depends on this one declaration."""
     assert BY_NAME["engine.moe_method"].kind is OpKind.CLASS_FACTORY
     assert types.FunctionType is not OpKind  # keep ``types`` imported for the fake-module helpers
+
+
+# ---------------------------------------------------------------------------------------------
+# In-place adapters: vLLM's protocol over a functional operator
+# ---------------------------------------------------------------------------------------------
+
+
+class _FakeOps:
+    """The operator layer's functional shape, with a log of what it was asked for."""
+
+    def __init__(self):
+        self.calls = []
+
+    def topk_softmax(self, scores, top_k, *, renormalize=True):
+        self.calls.append(("topk", top_k, renormalize))
+        values, indices = torch.softmax(scores.float(), -1).topk(top_k, -1)
+        if renormalize:
+            values = values / values.sum(-1, keepdim=True)
+        return values, indices.to(torch.int32)
+
+    def moe_align_block_size(self, topk_ids, num_experts, block_size, *, num_tokens=None):
+        self.calls.append(("align", num_experts, block_size, num_tokens))
+        pairs = topk_ids.numel()
+        # A deliberately *wider* buffer than vLLM allocates, so the adapter's prefix copy is exercised.
+        width = pairs + num_experts * block_size
+        sorted_ids = torch.full((width,), pairs, dtype=torch.int32)  # pairs == vLLM's pad sentinel
+        sorted_ids[:pairs] = torch.arange(pairs, dtype=torch.int32)
+        expert_ids = torch.arange(pairs // block_size + num_experts, dtype=torch.int32)
+        return sorted_ids, expert_ids, torch.tensor(num_experts * block_size, dtype=torch.int32)
+
+    def silu_and_mul(self, x):
+        self.calls.append(("silu", tuple(x.shape)))
+        half = x.shape[-1] // 2
+        return torch.nn.functional.silu(x[..., :half]) * x[..., half:]
+
+
+def test_topk_softmax_adapter_writes_vllms_buffers_in_place():
+    """vLLM's router allocates float32 weights and int32 ids, then reads them back (returns None)."""
+    from ascend_platform.engine.abi import vllm_0_23
+
+    ops = _FakeOps()
+    adapter = vllm_0_23.topk_softmax_inplace(ops.topk_softmax)
+    logits = torch.randn(5, 8)
+    weights = torch.empty(5, 2, dtype=torch.float32)
+    ids = torch.empty(5, 2, dtype=torch.int32)
+    token_expert = torch.empty(5, 2, dtype=torch.int32)
+
+    assert adapter(weights, ids, token_expert, logits, True) is None
+    values, indices = torch.softmax(logits, -1).topk(2, -1)
+    expected = values / values.sum(-1, keepdim=True)
+    assert torch.allclose(weights, expected)
+    assert torch.equal(ids, indices.to(torch.int32))
+    assert torch.equal(token_expert, ids), "the third buffer is filled, not left undefined"
+    assert ops.calls == [("topk", 2, True)], "top_k comes from the buffer width and renormalize passes through"
+
+
+def test_topk_softmax_adapter_refuses_grouped_routing():
+    """Ignoring the correction bias would pick the wrong experts - a silent accuracy bug."""
+    from ascend_platform.engine.abi import vllm_0_23
+
+    adapter = vllm_0_23.topk_softmax_inplace(_FakeOps().topk_softmax)
+    with pytest.raises(NotImplementedError, match="e_score_correction_bias"):
+        adapter(
+            torch.empty(2, 2, dtype=torch.float32),
+            torch.empty(2, 2, dtype=torch.int32),
+            torch.empty(2, 2, dtype=torch.int32),
+            torch.randn(2, 8),
+            False,
+            torch.zeros(8),
+        )
+
+
+def test_align_adapter_copies_the_prefix_and_keeps_the_sentinel_tail():
+    """vLLM sizes for the maximum and reads only up to ``num_tokens_post_pad``."""
+    from ascend_platform.engine.abi import vllm_0_23
+
+    ops = _FakeOps()
+    adapter = vllm_0_23.moe_align_block_size_inplace(ops.moe_align_block_size)
+    topk_ids = torch.randint(0, 8, (6, 2), dtype=torch.int32)
+    sorted_ids = torch.full((80,), -7, dtype=torch.int32)
+    expert_ids = torch.full((20,), -7, dtype=torch.int32)
+    post_pad = torch.empty(1, dtype=torch.int32)
+
+    assert adapter(topk_ids, 8, 4, sorted_ids, expert_ids, post_pad) is None
+    assert int(post_pad) == 32
+    width = 6 * 2 + 8 * 4
+    assert torch.equal(sorted_ids[:width], torch.tensor(
+        list(range(12)) + [12] * (width - 12), dtype=torch.int32
+    )), "the operator's whole output is copied, including its own pad sentinel"
+    assert torch.equal(sorted_ids[width:], torch.full((80 - width,), -7, dtype=torch.int32)), (
+        "beyond the operator's output the caller's buffer is untouched"
+    )
+    produced = 6 * 2 // 4 + 8  # what the fake returns: pairs // block_size + num_experts
+    assert torch.equal(expert_ids[:produced], torch.arange(produced, dtype=torch.int32))
+    assert torch.equal(expert_ids[produced:], torch.full((20 - produced,), -1, dtype=torch.int32)), (
+        "blocks the operator did not produce must be the -1 sentinel, never stale memory"
+    )
+    assert ops.calls == [("align", 8, 4, 6)], "num_tokens is the token count, not the pair count"
+
+
+def test_align_adapter_refuses_expert_parallel():
+    from ascend_platform.engine.abi import vllm_0_23
+
+    adapter = vllm_0_23.moe_align_block_size_inplace(_FakeOps().moe_align_block_size)
+    with pytest.raises(NotImplementedError, match="expert_map"):
+        adapter(
+            torch.zeros(2, 2, dtype=torch.int32), 8, 4,
+            torch.empty(20, dtype=torch.int32), torch.empty(10, dtype=torch.int32),
+            torch.empty(1, dtype=torch.int32), torch.zeros(8, dtype=torch.int32),
+        )
+
+
+def test_silu_and_mul_adapter_writes_the_out_buffer():
+    from ascend_platform.engine.abi import vllm_0_23
+
+    adapter = vllm_0_23.silu_and_mul_inplace(_FakeOps().silu_and_mul)
+    x = torch.randn(3, 8)
+    out = torch.empty(3, 4)
+    assert adapter(out, x) is None
+    assert torch.allclose(out, torch.nn.functional.silu(x[:, :4]) * x[:, 4:])
+
+
+def test_inplace_adapters_only_cover_the_symbols_that_exist():
+    """A semantic the operator does not serve stays unbound instead of becoming a raising proxy."""
+    from ascend_platform.engine.abi import vllm_0_23
+
+    ops = _FakeOps()
+    adapters = vllm_0_23.inplace_adapters(
+        {"moe.routing_topk_softmax": ops.topk_softmax, "moe.align_block_size": ops.moe_align_block_size}
+    )
+    assert set(adapters) == {"moe.routing_topk_softmax", "moe.align_block_size"}
+    assert set(vllm_0_23.INPLACE_ENGINE_SYMBOL) == {"moe.routing_topk_softmax", "moe.align_block_size"}, (
+        "the in-place table lists only symbols this release actually ships; moe.swiglu_gate is "
+        "excluded because vLLM 0.23 has no _custom_ops.silu_and_mul wrapper to bind it to"
+    )
+    assert "moe.swiglu_gate" not in vllm_0_23.ENGINE_SYMBOL
+    assert "moe.swiglu_gate" in vllm_0_23.NO_ENGINE_SYMBOL
