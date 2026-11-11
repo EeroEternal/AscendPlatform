@@ -33,6 +33,44 @@
 TileInfer/用户包的回落，甚至删掉。**在此之前，任何"用户自研算子包"都跑不了 Qwen3.6 的 GDN 部分**，
 因为平台根本不会向它要这些名字。
 
+### 用户自研算子包怎么接进来（两种形式，任选其一）
+
+这不是业界统一的"算子自声明"标准——**标准的是"扩展自己注册 + 纯数据 schema"这个形状**
+（PyTorch 的 `torch.library`/`TORCH_LIBRARY`、Python 的 `importlib.metadata` entry point、
+vLLM 自己的 `platform_plugins` / `general_plugins` / `CustomOp.register_oot` 都是这个形状）。
+不标准的是"宿主里写死一张路径表"（本仓的 `_LAYOUTS`），所以它只作为最后回落。
+
+形式 A（声明式，已有）：包根暴露 `describe()`，返回纯数据。
+
+```python
+def describe():
+    return {
+        "name": "my_ops", "version": "0.1.0",
+        "ops": {
+            "moe.routing_topk_softmax": "my_ops.moe:topk_softmax",
+            "gdn.l2norm": "my_ops.gdn:l2norm_fwd",
+        },
+    }
+```
+
+形式 B（协议式，新增）：包根暴露 `resolve(name)`，**一个函数、不用抄平台的词表**。
+
+```python
+def resolve(name):              # callable 或 None
+    if name.startswith("moe."):
+        return _MY_MOE[name]    # 没有就返回 None，平台会记成 "unbound + 原因"
+    return None
+```
+
+两种都不需要 import `ascend_platform`、也不需要认识 vLLM。选包有两种方式：`pip install` 后在
+`pyproject.toml` 里注册 entry point 组 `ascend_platform.providers`（装完即生效，最标准），或者
+`ASCEND_PLATFORM_OPS=<包名>` 显式指定。两者可同时用 `describe()` 与 `resolve()`：声明优先，
+`resolve()` 补漏。
+
+**所以回答"用户知道要声明吗"**：今天要读到这份文档才知道；补的是**可发现性**，不是机制。
+下一步该做的是 `ascend-platform provider-template`（打印上面两个模板之一）和 doctor 在报缺算子时
+直接打印"你的包缺这个语义名"。在那之前，这份文档 + `ascend-platform doctor` 的输出就是对接说明。
+
 ## 2. 调用约定（已修，这次）
 
 vLLM 的 `vllm._custom_ops.*` 是 **in-place** 的 C++ 包装：`topk_softmax(topk_weights, topk_ids,
@@ -85,3 +123,21 @@ RuntimeError: Only one platform plugin can be activated, but got: ['tileinfer', 
 tileinfer）。TileInfer 只在验证"用户自研算子包"这条路时才需要，且它是**被显式指定**的
 （`ASCEND_PLATFORM_OPS=tileinfer`），不再参与自动发现——`contracts/ports.OPERATOR_ROOTS` 现在只有
 `ascend_attention`。
+
+## 6. 算子侧 2026-11-11 那次实测的核对
+
+他们报的：`TypeError: topk_softmax() takes 2 positional arguments but 5 were given`，加 5 行适配器后
+model loaded 23.4s、生成正确、OK 29.1s；结论"阻塞不在本仓，缺平台 `engine/abi` 的两张 out-param 表"。
+
+**核对结果：崩溃原因、机制、方向都对，两处需要收紧。**
+
+| 他们的说法 | 核对 |
+|---|---|
+| 崩在 `topk_softmax`，因为 vLLM 是 out-param、我们发函数式 | ✅ 完全正确。vLLM 调 `(topk_weights, topk_ids, token_expert_indices, gating_output, renormalize)` 5 个位置参数（`router/fused_topk_router.py:17-30`），`(scores, top_k, *, renormalize)` 只收 2 个位置参数，报错就是这句 |
+| 平台把我们的函数直接塞进那个符号 | ✅ 正确，`install.py` 的 `_attribute_takeover` 就是这个行为（现在被 `engine_impls` 覆盖） |
+| 缺 `engine/abi` 里两张 out-param → 函数式表 | ⚠️ 方向对，但**只证明了第一张**。他们的链路里 `engine.moe_method` 已注入，走的是 `_MoEKernel.apply → fused_experts`，而 `_custom_ops.moe_align_block_size` 只在 vLLM 自己的 Triton 专家路径里被调（`fused_experts`/`_prepare_expert_assignment`，`fused_moe.py:1425-1465`、`triton_moe.py:235`），这条路径被绕开了。第二张表是为"MoE 方法没被注入"（例如量化检查点）准备的，属于预防不是必需 |
+| GDN 8 个符号实测解到 `ops.fla.chunk` / `ops.gdn.leaves` / `ops.fla.causal_conv1d` | ✅ 与我们的绑定报告一致；但**它们不是经他们的 `describe()` 绑定**，是经平台 `_LAYOUTS` 的硬编码路径（本仓 `contracts/ports.py`）。所以"阻塞不在本仓"对**这次端到端**成立，对"用户自研算子包也能跑 qwen3.6"不成立——那是本仓 + 算子仓各一半 |
+| attention（decode+prefill）、MoE 专家计算走本仓 | ✅ 与绑定报告一致（`attention.*` 是平台后端，`engine.moe_method` 是平台类工厂） |
+
+两张表本仓都已在 `d43fe09` 落地（`engine/abi/vllm_0_23.py::INPLACE_ENGINE_SYMBOL` +
+`inplace_adapters()`），并有用真实 `vllm._custom_ops` 属性、按 vLLM 调用协议跑的验证。

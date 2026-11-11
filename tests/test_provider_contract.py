@@ -310,3 +310,96 @@ def test_the_moe_class_takeover_never_takes_a_plain_compute_function(monkeypatch
     finally:
         reset_provider()
         reset_operator_layer()
+
+
+# ---------------------------------------------------------------------------------------------
+# The protocol form: resolve(name) instead of a table
+# ---------------------------------------------------------------------------------------------
+
+
+def _fake_layer(tmp_path, monkeypatch, *, describe: str = "", resolve: str = "") -> str:
+    """An importable package with the parts asked for, and nothing else.  Returns its name."""
+    root_name = f"userops_{abs(hash((describe, resolve))) % 100000}"
+    root = tmp_path / root_name
+    root.mkdir()
+    body = [
+        '"""A user package: no platform import, no engine import."""',
+        "",
+        "def handle(x):",
+        "    return x",
+        "",
+        "__all__ = ['handle']",
+    ]
+    if describe:
+        body += ["", "def describe():", f"    {describe}"]
+    if resolve:
+        body += ["", "def resolve(name):", f"    {resolve}"]
+    (root / "__init__.py").write_text("\n".join(body) + "\n", encoding="utf-8")
+
+    import sys
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop(root_name, None)
+    from ascend_platform.contracts import ports, provider
+
+    monkeypatch.setattr(ports, "OPERATOR_ROOTS", (root_name,))
+    monkeypatch.delenv(ports.ENV_OPS_LAYER, raising=False)
+    provider.reset_provider()
+    return root_name
+
+
+def test_a_package_can_answer_per_name_without_enumerating(tmp_path, monkeypatch):
+    """``resolve(name)`` is the whole contract: one function, no vocabulary to copy."""
+    name = _fake_layer(
+        tmp_path,
+        monkeypatch,
+        resolve="return handle if name.startswith('moe.') else None",
+    )
+    from ascend_platform.contracts.provider import discover, provider
+
+    descriptor = discover()
+    assert descriptor is not None
+    assert descriptor.name == name
+    assert descriptor.ops == {}, "a protocol-only package enumerates nothing"
+    assert "no ops" in descriptor.summary()
+
+    serving = provider()
+    impl, reason = serving.load("moe.experts")
+    assert callable(impl) and reason == ""
+    assert serving.load("gdn.l2norm") == (
+        None,
+        f"provider {name!r}: resolve('gdn.l2norm') returned None",
+    )
+
+
+def test_describe_wins_per_name_and_resolve_fills_the_gaps(tmp_path, monkeypatch):
+    """Both forms at once: the declared table is authoritative, the hook answers the rest."""
+    name = _fake_layer(
+        tmp_path,
+        monkeypatch,
+        describe='return {"name": "userops", "version": "1.0", "ops": {"moe.experts": f"{__name__}:handle"}}',
+        resolve="return handle if name == 'moe.align_block_size' else None",
+    )
+    from ascend_platform.contracts.provider import discover, provider
+
+    descriptor = discover()
+    assert descriptor.ops["moe.experts"].target == f"{name}:handle"
+    serving = provider()
+    assert serving.load("moe.experts")[0] is not None
+    assert callable(serving.load("moe.align_block_size")[0])
+
+
+def test_a_resolver_that_raises_is_a_reason_not_a_crash(tmp_path, monkeypatch):
+    name = _fake_layer(tmp_path, monkeypatch, resolve="raise RuntimeError('boom')")
+    from ascend_platform.contracts.provider import provider
+
+    impl, reason = provider().load("moe.experts")
+    assert impl is None
+    assert "resolve('moe.experts') raised RuntimeError('boom')" in reason
+
+
+def test_a_package_with_neither_form_is_not_a_provider(tmp_path, monkeypatch):
+    _fake_layer(tmp_path, monkeypatch)
+    from ascend_platform.contracts.provider import discover
+
+    assert discover() is None

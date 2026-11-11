@@ -80,7 +80,10 @@
 实测（真 vLLM 0.23 符号 + 拆分后的算子仓）：**13 个必需算子 → 11 bound / 1 declined / 1 off by switch**。
 
 用户自带算子走同一条路：任何实现了上面三件的包都可以被 `ASCEND_PLATFORM_OPS=<name>` 选中，
-本仓不区分"官方算子仓"与"用户算子包"。自动发现只认**一个**根（`ascend_attention`），因为支持的
+本仓不区分"官方算子仓"与"用户算子包"。对接有两种形式：包根暴露 `describe()` 返回纯数据表
+（声明式），或只暴露 `resolve(semantic) -> callable | None`（协议式，一个函数、不用抄词表）；
+也可以在 `pyproject.toml` 里注册 entry point 组 `ascend_platform.providers`，装完即生效。
+两种形式都不需要 import 本仓，也不需要认识 vLLM。自动发现只认**一个**根（`ascend_attention`），因为支持的
 依赖方向是 `vllm` + 本仓 + `AscendAttention`；别的包（包括迁移源 TileInfer）都必须显式指定。
 
 vLLM 的 `_custom_ops` 里有几个符号是**写进调用方预分配缓冲区**的（`topk_softmax`、

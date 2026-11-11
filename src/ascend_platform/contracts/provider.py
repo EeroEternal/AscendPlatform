@@ -255,7 +255,7 @@ def _from_entry_points() -> Iterator[Tuple[str, ProviderDescriptor]]:
             )
 
 
-def _from_operator_layer() -> Optional[ProviderDescriptor]:
+def _from_operator_layer() -> Optional[Tuple[ProviderDescriptor, Optional[Callable[[str], Any]]]]:
     """Ask the *resolved* operator layer first - whichever root won, pinned or by preference.
 
     Using the port's own resolution (rather than reading the environment here) is what makes a
@@ -278,16 +278,41 @@ def _from_operator_layer() -> Optional[ProviderDescriptor]:
         logger.debug("ascend-platform provider: %s does not import (%r)", layer.root, exc)
         return None
     describe = getattr(module, "describe", None)
+    resolver = _resolver_of(module)
     if describe is None:
-        return None
+        if resolver is None:
+            return None
+        return _resolver_only(layer.root, source, resolver), resolver
     try:
-        return _call_describe(describe, source)
+        descriptor = _call_describe(describe, source)
     except ProviderError as exc:
         logger.warning("ascend-platform provider %s: bad descriptor (%s); ignored", layer.root, exc)
         return None
+    # ``describe()`` is the declarative form and wins per name; ``resolve()`` fills the gaps (a
+    # package may publish both, e.g. a stable table plus a dynamically generated family).
+    return descriptor, resolver
 
 
-_CACHE: Dict[str, Any] = {"resolved": False, "provider": None}
+#: A package may answer per-name instead of enumerating: ``resolve(semantic) -> callable | None``.
+#: One function, no vocabulary to copy - the protocol form of the same contract.
+_RESOLVER_ATTR = "resolve"
+
+_CACHE: Dict[str, Any] = {"resolved": False, "provider": None, "resolver": None}
+
+
+def _resolver_of(module: Any) -> Optional[Callable[[str], Any]]:
+    """The package's ``resolve(name)`` hook, when it publishes one."""
+    resolver = getattr(module, _RESOLVER_ATTR, None)
+    return resolver if callable(resolver) else None
+
+
+def _resolver_only(root: str, source: str, resolver: Callable[[str], Any]) -> ProviderDescriptor:
+    """A descriptor for a package that answers per name and enumerates nothing.
+
+    ``ops`` stays empty on purpose: an empty table means "ask, do not assume", and every consumer
+    already treats a missing entry as "this provider does not serve it" before the resolver runs.
+    """
+    return ProviderDescriptor(name=root, version="", source=source, ops={})
 
 
 def discover() -> Optional[ProviderDescriptor]:
@@ -299,20 +324,31 @@ def discover() -> Optional[ProviderDescriptor]:
     """
     if _CACHE["resolved"]:
         return _CACHE["provider"]
-    found = _from_operator_layer()
+    resolver: Optional[Callable[[str], Any]] = None
+    found: Optional[ProviderDescriptor] = None
+    layer = _from_operator_layer()
+    if layer is not None:
+        found, resolver = layer
     if found is None:
         found = next((descriptor for _name, descriptor in _from_entry_points()), None)
     if found is not None:
-        logger.info("ascend-platform %s", found.summary())
-    _CACHE.update(resolved=True, provider=found)
+        logger.info(
+            "ascend-platform %s%s",
+            found.summary(),
+            " + resolve()" if resolver is not None else "",
+        )
+    _CACHE.update(resolved=True, provider=found, resolver=resolver)
     return found
 
 
 class _Provider:
     """The resolved provider, with per-op caching so a miss is remembered and reported once."""
 
-    def __init__(self, descriptor: ProviderDescriptor) -> None:
+    def __init__(
+        self, descriptor: ProviderDescriptor, resolver: Optional[Callable[[str], Any]] = None
+    ) -> None:
         self.descriptor = descriptor
+        self.resolver = resolver
         self._impls: Dict[str, Tuple[Any, str]] = {}
 
     def op(self, name: str) -> Optional[ProviderOp]:
@@ -324,6 +360,20 @@ class _Provider:
         if name in self._impls:
             return self._impls[name]
         op = self.descriptor.ops.get(name)
+        if op is None and self.resolver is not None:
+            # Protocol form: the package decides per name and returns None when it does not have it.
+            try:
+                found = self.resolver(name)
+            except Exception as exc:  # noqa: BLE001 - a user package must not crash the probe
+                result = (None, f"provider {self.descriptor.name!r}: resolve({name!r}) raised {exc!r}")
+            else:
+                result = (
+                    (found, "")
+                    if callable(found)
+                    else (None, f"provider {self.descriptor.name!r}: resolve({name!r}) returned {found!r}")
+                )
+            self._impls[name] = result
+            return result
         if op is None:
             result: Tuple[Any, str] = (
                 None,
@@ -342,12 +392,12 @@ class _Provider:
 def provider() -> Optional[_Provider]:
     """The provider as a loader, or ``None`` when nothing announced itself."""
     descriptor = discover()
-    return None if descriptor is None else _Provider(descriptor)
+    return None if descriptor is None else _Provider(descriptor, _CACHE.get("resolver"))
 
 
 def reset_provider() -> None:
     """Forget the discovery result (tests, and after installing a provider in-process)."""
-    _CACHE.update(resolved=False, provider=None)
+    _CACHE.update(resolved=False, provider=None, resolver=None)
 
 
 def describe_provider() -> Dict[str, Any]:
