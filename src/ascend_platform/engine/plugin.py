@@ -196,6 +196,12 @@ ENV_GRAPH_BRIDGE = "TILEINFER_VLLM_GRAPH_BRIDGE"
 #: re-exported here only so ``status()``/the banner can name it without importing that module.
 ENV_OPS = "TILEINFER_OPS"
 
+#: vLLM V1 runs ``EngineCore`` in a forked child by default, and ``torch_npu`` refuses to initialise
+#: the device there: ``RuntimeError: Cannot re-initialize NPU in forked subprocess``.  Single-card
+#: serving is the only thing this platform does, so the in-process core is both correct and the
+#: configuration every validated run used.  Pinned here so the operator does not have to know.
+ENV_V1_MULTIPROC = "VLLM_ENABLE_V1_MULTIPROCESSING"
+
 #: Set once per process by :func:`_ensure_visible_logs`; the function is idempotent but this keeps
 #: the common case to one attribute test.
 _LOGS_MADE_VISIBLE = [False]
@@ -334,6 +340,53 @@ def _vllm_probe() -> Dict[str, Any]:
 # =============================================================================================
 # Step 1: the patch registry
 # =============================================================================================
+
+
+def _pin_single_process_on_npu() -> str:
+    """Force the in-process engine core on NPU, unless the operator pinned the variable themselves.
+
+    Returns a one-line outcome for the boot banner.  Cheap and side-effect free on a CPU box: the
+    device probe only looks at the already-imported modules, and a non-NPU process is left alone.
+    """
+    import os
+
+    explicit = os.environ.get(ENV_V1_MULTIPROC, "").strip()
+    if not _device_is_npu():
+        return "not NPU: vLLM's multiprocessing default left alone"
+    if explicit and explicit != "1":
+        return f"{ENV_V1_MULTIPROC}={explicit} (set by the operator; left alone)"
+    if explicit == "1":
+        logger.warning(
+            "ascend-platform: %s=1 was requested, but torch_npu cannot re-initialise the device in "
+            "a forked child and vLLM 0.23 forks EngineCore by default. Expect "
+            "'Cannot re-initialize NPU in forked subprocess' unless "
+            "VLLM_WORKER_MULTIPROC_METHOD=spawn is also set; the pin was left untouched because "
+            "an explicit setting is the operator's call.",
+            ENV_V1_MULTIPROC,
+        )
+        return f"{ENV_V1_MULTIPROC}=1 (explicit; fork will fail without spawn)"
+    os.environ[ENV_V1_MULTIPROC] = "0"
+    logger.info(
+        "ascend-platform: %s=0 pinned (torch_npu cannot initialise in a forked child; set it "
+        "yourself to override, or pair =1 with VLLM_WORKER_MULTIPROC_METHOD=spawn)",
+        ENV_V1_MULTIPROC,
+    )
+    return f"{ENV_V1_MULTIPROC}=0 (pinned: NPU device is not fork-safe)"
+
+
+def _device_is_npu() -> bool:
+    """Is this process on an Ascend NPU?  Reads module state only; never initialises a device.
+
+    ``torch_npu`` being installed is the signal: this plugin is only loaded when the Ascend platform
+    was selected, so the two facts are the same one.  Probing the *device* here would initialise it
+    before vLLM's worker does, which is exactly the ordering the fork problem comes from.
+    """
+    if "torch_npu" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("torch_npu") is not None
+    except (ImportError, ValueError):  # pragma: no cover - a spec-less module
+        return False
 
 
 def _install_patches(strict: bool) -> Optional[patches.InstallReport]:
@@ -785,6 +838,7 @@ def install(*, strict: Optional[bool] = None) -> bool:
                 )
 
             strict = _env_flag(ENV_STRICT, False) if strict is None else bool(strict)
+            process = _pin_single_process_on_npu()
             report = _install_patches(strict)
             backend = _install_backend()
             graph = _install_graph_bridge()
@@ -802,10 +856,11 @@ def install(*, strict: Optional[bool] = None) -> bool:
                 graph=graph,
                 ops=ops,
                 models=models,
+                process=process,
             )
             logger.info(
                 "ascend-platform vLLM plugin installed | %s | strict=%s | %s | backend: %s | graph: %s "
-                "| %s | models: %s",
+                "| %s | models: %s | %s",
                 probe["detail"],
                 strict,
                 report.summary() if report is not None else "patch registry unavailable",
@@ -813,6 +868,7 @@ def install(*, strict: Optional[bool] = None) -> bool:
                 graph["detail"],
                 ops["detail"],
                 models["detail"],
+                process,
             )
             return True
         except OperatorRequirementsUnmet as exc:

@@ -11,6 +11,8 @@ These tests are pure data plus a fake report - no vLLM, no operators, no device.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from ascend_platform.contracts.vocabulary import validate
@@ -163,3 +165,34 @@ def test_the_refusal_is_not_swallowed_by_the_blanket_handler(monkeypatch):
         "a process that refused to boot must not cache itself as installed, or a retry after "
         "fixing the layer becomes a no-op"
     )
+
+
+def test_the_npu_pins_the_in_process_engine_core(monkeypatch):
+    """torch_npu refuses to initialise in vLLM's forked child; the platform must not make the
+    operator learn that from a traceback."""
+    from ascend_platform.engine import plugin
+
+    monkeypatch.delenv(plugin.ENV_V1_MULTIPROC, raising=False)
+    monkeypatch.setattr(plugin, "_device_is_npu", lambda: True)
+    outcome = plugin._pin_single_process_on_npu()
+    assert os.environ[plugin.ENV_V1_MULTIPROC] == "0"
+    assert "pinned" in outcome
+
+
+def test_an_explicit_setting_is_the_operators_call(monkeypatch):
+    from ascend_platform.engine import plugin
+
+    monkeypatch.setenv(plugin.ENV_V1_MULTIPROC, "1")
+    monkeypatch.setattr(plugin, "_device_is_npu", lambda: True)
+    outcome = plugin._pin_single_process_on_npu()
+    assert os.environ[plugin.ENV_V1_MULTIPROC] == "1", "an explicit value is not overwritten"
+    assert "explicit" in outcome
+
+
+def test_a_cpu_box_is_left_alone(monkeypatch):
+    from ascend_platform.engine import plugin
+
+    monkeypatch.delenv(plugin.ENV_V1_MULTIPROC, raising=False)
+    monkeypatch.setattr(plugin, "_device_is_npu", lambda: False)
+    assert "left alone" in plugin._pin_single_process_on_npu()
+    assert plugin.ENV_V1_MULTIPROC not in os.environ

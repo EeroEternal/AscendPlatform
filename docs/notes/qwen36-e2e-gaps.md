@@ -180,3 +180,74 @@ must use the 'spawn' start method`。必须 `VLLM_ENABLE_V1_MULTIPROCESSING=0`�
 |---|---|---|
 | `The capital of France is` | ` Paris` | 11751: -0.569381, 264: -2.194381, 279: -3.006881, 3750: -3.631881, 271: -3.694381 |
 | `1+1=` | `2` | 17: -0.806895, 18: -1.306895, 16: -2.244395, 15: -3.744395, 10992: -3.556895 |
+
+## 8. 项目环境、fork 与"长生成退化"的定位（2026-11-11 15:0x–16:0x）
+
+### 8.1 项目环境里只有 ascend_platform
+
+`.venv`（仓库内，从共享栈 venv 复制后剪掉 `tileinfer` / `tile_kernels` / `vllm_ascend`）：
+
+```
+vllm.platform_plugins -> ['ascend_platform']
+```
+
+`import vllm` 不再需要 `VLLM_PLUGINS`，也不会出现第二个 platform plugin 的
+`RuntimeError: Multiple platform plugins`。算子层用 `PYTHONPATH=<AscendAttention>/src` +
+`ASCEND_PLATFORM_OPS=ascend_attention` 接入，不装进环境（对方的树保持只读）。
+
+### 8.2 平台自己钉住单进程（新修）
+
+`torch_npu` 不能在 fork 出来的子进程里初始化，而 vLLM 0.23 的 V1 默认 fork `EngineCore`：
+`RuntimeError: Cannot re-initialize NPU in forked subprocess`。以前靠人记住
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`（`docs/hardware-checklist.md` §0）；现在 `plugin.install()` 在
+NPU 上自己钉住并写进启动横幅（`VLLM_ENABLE_V1_MULTIPROCESSING=0 (pinned: NPU device is not
+fork-safe)`），显式设置的值仍然以操作者为准（`=1` 时只警告不覆盖）。三个 CPU 测试钉住行为。
+对照：TileInfer 平台至今仍需要手工设这个变量，所以这是平台该担的责任，不是使用者的作业。
+
+### 8.3 算子侧还有一个"待补"：`hostcache` 硬 import tileinfer
+
+干净环境里第一次 prefill 就崩：
+
+```
+File ".../ascend_attention/ops/fla/hostcache.py", line 46, in _enabled
+    from tileinfer.serving import flags
+ModuleNotFoundError: No module named 'tileinfer'
+  ← chunk_local_cumsum → _chunk_cumsum → chunk_gated_delta_rule_fwd → GDN prefill（30 层各一次）
+```
+
+`hostcache._enabled()` 无条件 `from tileinfer.serving import flags` 再读
+`flags.flag("gdn_host_cache", "TILEINFER_GDN_HOST_CACHE", False)`。也就是说
+**AscendAttention 在 GDN prefill 路径上硬依赖迁移源**——这不是"没有待补的算子"，而是一行 import
+该删（`os.environ.get("ASCEND_ATTENTION_GDN_HOST_CACHE", "0")` 即可，默认本来就关）。
+
+反向的同类问题在我们这边：本仓仍有 `TILEINFER_OPS` / `TILEINFER_VLLM_*` 这类旧前缀（功能上无依赖，
+纯命名），属于我们自己的清理项。
+
+### 8.4 "长生成退化"复现与定位：不是算子侧，是一次 NaN
+
+chat template、`temperature=0`、`max_new=256`、`max_model_len=2048`：
+
+```
+PROMPT_TOKENS 36
+GEN 154.9s tokens=256 repeat_head=0.754 repeat_tail=0.984
+TEXT 'Thinking Process:\n\n1.  **Deconstruct the Request:**\n!!!!!!…'
+token 14 起 token_id 恒为 0（'!'），且从 k=14 开始 lp_dec=nan
+k=0..13：prefill 与 decode 的 argmax 全部一致、logprob 相差 <1e-2
+MISMATCH 17/256，全部落在 11–31（近 tie 区），k>31 之后两条路径一致（都在吐 '!'）
+```
+
+同一提示换 TileInfer 当算子层（同一个平台、同一个 attention）：**同样在 ~14 token 崩成 `!`**
+（18/192 分歧，tail ratio 0.984）。所以退化**不是** AscendAttention 的算子造成的，而是平台侧
+（attention/state 数值）或模型接入；而且它不是"逐渐退化"，是**某一步 logits 直接变 NaN**，greedy
+此后一直选 token 0，NaN 状态被喂回去，于是永远 `!`。
+
+复现工具进了仓库：`tools/diag_longgen.py`（`MISMATCH` / `NAN_AT` / `REPEAT` 三项，非 0 退出码可当
+回归门）。下一步的二分：`TILEINFER_OPS=moe`（GDN 交给 vLLM 自己的 FLA 实现）看 NaN 是否消失，
+以区分"GDN decode 状态"与"attention decode 内核 / 平台状态交接"。
+
+### 8.5 顺带测到的性能事实
+
+同样 192 token、同一 attention：TileInfer 算子层 `GEN 18.2s`，AscendAttention 算子层 `GEN 117.2s`；
+差别不在 decode（两者 decode 都约 10.5 tok/s），而在 **GDN prefill 每次换序列长度都重新编译**
+（连续两次 prefill 分别 129.7 s / 112.9 s，而 TileInfer 侧同一 prefill 0.8 s）。这不是正确性 bug，
+是算子侧 JIT 缓存键/`TILELANG_CACHE_DIR` 没接上的问题。
