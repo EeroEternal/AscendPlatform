@@ -480,6 +480,19 @@ vLLM 0.23.0 | strict=False | patches: 3 applied, 0 skipped (target gone), 0 fail
 | 逐项绑定 + provider 发现 | 10 bound / 2 unbound / 1 off |
 | 再加 `engine/abi`（符号表 + MoE 类工厂） | **11 bound / 1 unbound / 1 off** |
 
+再下一步：**强制/可选分开**（`ops/requirements.py`）。原来"10 bound"是个数字，没有判决——一个我们
+刻意 decline 的算子（`chunk_local_cumsum`）和一个真正缺的强制算子（`engine.moe_method`）在报告里长得
+一模一样。现在每条要求带 `mandatory` 与理由，`report.servable` 给出结论，`doctor` 那一条按它 FAIL：
+
+```
+ops: 11 bound, 1 unbound ..., 1 off by switch | dense=off gdn=on moe=on
+servable: True   （可选缺失：gdn.chunk_local_cumsum、moe.swiglu_gate）
+ops: 10 bound, 2 unbound ... | CANNOT SERVE: missing mandatory engine.moe_method   ← 没注入 ABI 时
+```
+
+顺带修掉一个自己写的 bug：`servable` 最初只有 docstring 没有 `return`，于是它恒为 `None`——测试立刻
+补上，因为"报了一个不存在的判决"比没报更糟。
+
 再往后一步：**符号表也由引擎层发布**（`install_ops(engine_symbols=...)`，插件传
 `engine/abi/vllm_0_23.ENGINE_SYMBOL`）。发布后它是权威——每个绑定记录带 `platform_name`（语义名），
 两边路径不一致就报 "engine ABI drift" 并拒绝绑定，而不是"谁先读到算谁"。这样"引擎知识只在 ABI 层"
@@ -531,6 +544,7 @@ vLLM 0.23.0 | strict=False | patches: 3 applied, 0 skipped (target gone), 0 fail
 **"整文件没人跑过"才是**。
 
 | `tests/test_engine_abi.py` | ABI 层：符号表完整且与绑定表一致（漂移即报，两个名字都打出来）、`experts_cls.is_monolithic()`（**方法**）与 `moe_kernel.is_monolithic`（**属性**）两种调用约定、`apply` 确实走到注入的 compute、`shared_experts` 不被重复加、非 OOT 后端拒绝构造、上游替换 kernel 时大声报错、import 本模块不拉 `vllm` |
+| `tests/test_requirements.py` | 强制/可选：每条要求都是词表里的名字、关掉的族不算缺口、可选缺失不影响 `servable`、强制缺失时 `summary()` 与 `servable` 一致、每条要求都有理由 |
 | `tests/test_provider_contract.py` | provider 契约：两种描述符形状、坏字段/坏区间/坏目标的措辞、`ASCEND_PLATFORM_OPS` 优先于 entry point、坏 provider 不拖垮启动、`load()` 的 miss 句子、provider 胜于布局路径、compute 不能冒充 class factory |
 
 ## 5.5 许可证

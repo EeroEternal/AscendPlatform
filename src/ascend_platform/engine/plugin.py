@@ -533,14 +533,7 @@ def _install_ops() -> Dict[str, Any]:
     try:
         from ascend_platform.ops.install import install_ops
 
-        from ascend_platform.engine.abi import vllm_0_23
-
-        report = install_ops(
-            engine_factories=_engine_factories(),
-            # The vLLM 0.23 symbol table: the engine layer is the authority on what this release
-            # ships, so the family table's own targets are checked against it at plan time.
-            engine_symbols=vllm_0_23.ENGINE_SYMBOL,
-        )
+        report = install_ops(**engine_install_kwargs())
     except Exception as exc:  # noqa: BLE001 - a general plugin must not raise
         info["detail"] = f"install_ops() raised {exc!r}; vLLM's own operators are still in place"
         logger.warning("ascend-platform ops: %s", info["detail"])
@@ -559,6 +552,23 @@ def _install_ops() -> Dict[str, Any]:
             report.details.get(op, "no reason recorded"),
         )
     return info
+
+
+def engine_install_kwargs() -> Dict[str, Any]:
+    """Everything the engine layer injects into ``install_ops`` - one place, two callers.
+
+    The plugin installs operators during boot; ``doctor`` re-runs the same install to report on it.
+    If doctor passed nothing, it would report the ``engine.moe_method`` slot as missing on a machine
+    where the plugin bound it - a self-inflicted false failure, so both go through this function.
+    """
+    from ascend_platform.engine.abi import vllm_0_23
+
+    return {
+        "engine_factories": _engine_factories(),
+        # The vLLM 0.23 symbol table: the engine layer is the authority on what this release ships,
+        # so the family table's own targets are checked against it at plan time.
+        "engine_symbols": vllm_0_23.ENGINE_SYMBOL,
+    }
 
 
 def _engine_factories() -> Dict[str, Any]:

@@ -56,7 +56,10 @@
 "换引擎只改本仓"的含义。
 
 **逐项生效，不搞全有全无**：每个算子有四种状态——`bound` / `unbound(原因)` / `declined(原因)` /
-`disabled(开关)`；缺一个只影响它自己，只有"该模型族声明为强制"的算子缺失才拒绝启动。
+`disabled(开关)`；缺一个只影响它自己。**强制/可选分开**（`ops/requirements.py`）：可选算子缺失
+（如 `gdn.chunk_local_cumsum`，我们刻意拒绝）照常服务；**强制**算子缺失时 `install_ops()` 记
+`report.servable = False`，日志打 `CANNOT SERVE`，`doctor` 那一条变 FAIL——**不静默跑错**。
+（让引擎在启动阶段直接拒绝，需要 worker 侧读这个标志，属未做项。）
 
 **现状（别按文档假定已实现）**：两块都通了，但都不是终态：
 

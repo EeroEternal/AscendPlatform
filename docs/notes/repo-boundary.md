@@ -82,7 +82,7 @@ UNBOUND chunk_local_cumsum  :: declined - not a drop-in（刻意拒绝，FLA 的
 | ✅ | 语义名词表 + `platform_name` 映射：`contracts/vocabulary.py` 是封闭集合，每个名字带 `kind`（`compute` / `class_factory`），类别不符在绑定期就拒 | `contracts/vocabulary.py` + `provider.ProviderOp.kind` + `gdn_moe._wrong_kind` |
 | ✅ | 符号表由引擎层发布：`install_ops(engine_symbols=...)`，记录带 `platform_name`，与 `engine/abi` 不一致即报 drift 并拒绝绑定 | `ops/install.py::_targets_of` + `engine/plugin.py`（`tests/test_engine_abi.py`） |
 | ✅ | vLLM ABI 适配上移：符号表与 `UnquantizedFusedMoEMethod` 的类替换都进了 `engine/abi/vllm_0_23.py`，由引擎层注入给 `install_ops(engine_factories=...)`；`unquantized_fused_moe` 现在能绑 | `engine/abi/vllm_0_23.py` + `engine/plugin.py::_engine_factories`（`tests/test_engine_abi.py`） |
-| P1 | 模型族要求改成"语义算子 + 强制/可选"两档，不再是一张 vLLM 符号表 | `ops/families/gdn_moe.py` → `ops/requirements.py` |
+| ✅ | 模型族要求改成"语义算子 + 强制/可选"两档：`ops/requirements.py` 声明每条要求的 `mandatory` 与理由；`report.servable` 给出判决，`doctor` 的绑定检查按它 FAIL | `ops/requirements.py` + `install.OpsReport.servable`（`tests/test_requirements.py`） |
 | ✅ | 「`OPERATOR_ROOTS` 两份」是**重复声明**，不是行为分歧：`_acl.py` 那份只被分层测试按 `any(... for root in ...)` 读（顺序无关），活的那份在 `src/ascend_platform/contracts/ports.py:59`，被 `_candidates()` 消费——**顺序即优先级** | 已做：删掉 `_acl` 副本，测试改读端口那一份；`ports.py` 写明"顺序即优先级" |
 | P2 | "每次调用选实现"的谓词下沉到算子库（它掌握形状与编译缓存），本仓只留总开关 | `ops/candidates.py` 的取舍 |
 

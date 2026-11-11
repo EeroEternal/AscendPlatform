@@ -659,7 +659,16 @@ def _check_ops_binding() -> Tuple[str, str, str]:
             f"skipped: ascend_platform.ops.install is not importable ({exc!r}){candidates}",
             "fix the torch check first (docs/hardware-checklist.md step 1)",
         )
-    report = install_ops()  # idempotent and never raises by contract
+    # Same injection the boot uses (``engine/plugin.engine_install_kwargs``): with nothing injected,
+    # this check would report the MoE method slot as missing even where the plugin bound it.
+    try:
+        from ascend_platform.engine.plugin import engine_install_kwargs
+
+        kwargs = engine_install_kwargs()
+    except Exception as exc:  # noqa: BLE001 - a doctor check must not raise
+        logger.debug("ascend-platform doctor: engine kwargs unavailable (%r)", exc)
+        kwargs = {}
+    report = install_ops(**kwargs)  # idempotent and never raises by contract
     # ``chunk_local_cumsum`` is reported *unbound on purpose* (abi_ok=False: our port is not
     # upstream's drop-in).  Only an unbound op we expected to bind is a failure.
     declined = {binding.op for binding in bindings() if not binding.abi_ok}
@@ -681,6 +690,15 @@ def _check_ops_binding() -> Tuple[str, str, str]:
         detail += " | bound: " + ", ".join(report.bound)
     if declined:
         detail += " | declined on purpose: " + ", ".join(sorted(declined))
+    if report.missing_mandatory:
+        return _fail(
+            detail + " | cannot serve: missing mandatory " + ", ".join(report.missing_mandatory)
+            + candidates,
+            "a mandatory operator of an enabled family did not bind, so the model cannot run on "
+            "Ascend whatever the bound count says. Each reason is in "
+            "install_ops().details[<op>]; the family's requirements are "
+            "ascend_platform/ops/requirements.py - docs/hardware-checklist.md step 9",
+        )
     if unexpected:
         return _fail(
             detail + " | unexpected unbound: " + ", ".join(unexpected) + candidates,

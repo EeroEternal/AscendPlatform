@@ -184,10 +184,28 @@ class OpsReport:
     layer_error: str = ""
     #: The operator layer's declared version as verified at start-up (empty when nothing was bound).
     operator_version: str = ""
+    #: Semantic names (``contracts/vocabulary.py``) of the ops that bound, so requirements can be
+    #: classified without translating vLLM-facing names back through the table.
+    bound_semantics: List[str] = field(default_factory=list)
+    #: Requirements of the *enabled* families that did not bind.  ``missing_mandatory`` is the one
+    #: that matters: the family cannot serve a request, whatever the bound count says.
+    missing_mandatory: List[str] = field(default_factory=list)
+    missing_optional: List[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return not self.unbound
+
+    @property
+    def servable(self) -> bool:
+        """Can the enabled families actually run?  False when a mandatory requirement is missing.
+
+        Deliberately not the same as :attr:`ok`: a declined-by-design op (``chunk_local_cumsum``)
+        makes ``ok`` False while the family still runs, and an optional op that never bound does not
+        matter at all.  Both facts have been reported as "10 bound" until now, which is why this
+        property exists.
+        """
+        return not self.missing_mandatory
 
     def summary(self) -> str:
         families = " ".join(
@@ -196,6 +214,11 @@ class OpsReport:
         return (
             f"ops: {len(self.bound)} bound, {len(self.unbound)} unbound "
             f"(no vLLM name / no implementation), {len(self.disabled)} off by switch"
+            + (
+                " | CANNOT SERVE: missing mandatory " + ", ".join(self.missing_mandatory)
+                if self.missing_mandatory
+                else ""
+            )
             + (f" | {families}" if families else "")
             + (f" | operator layer unavailable: {self.layer_error}" if self.layer_error else "")
             + (f" | operator version {self.operator_version}" if self.operator_version else "")
@@ -854,6 +877,30 @@ def install_ops(
                                 "and apply)"
                             )
                         report.unbound.append(binding.op)
+
+            platform_name_of = {
+                binding.op: binding.platform_name
+                for _name, _module, entries in families
+                for binding in entries
+            }
+            report.bound_semantics = sorted(
+                {platform_name_of.get(op, "") for op in report.bound} - {""}
+            )
+            try:
+                from ascend_platform.ops import requirements as requirements_mod
+
+                report.missing_mandatory, report.missing_optional = requirements_mod.classify(
+                    report.bound_semantics, report.families
+                )
+            except Exception as exc:  # noqa: BLE001 - a classification bug must not stop the boot
+                logger.debug("ascend-platform ops: requirement classification failed (%r)", exc)
+            if report.missing_mandatory:
+                logger.error(
+                    "ascend-platform ops: CANNOT SERVE - the enabled families are missing mandatory "
+                    "operators (%s); the model will fail on the first forward rather than run on "
+                    "the wrong implementation. See `ascend-platform doctor`.",
+                    ", ".join(report.missing_mandatory),
+                )
 
             for op in report.unbound:
                 logger.warning("ascend-platform op unbound: %s - %s", op, report.details.get(op, ""))
