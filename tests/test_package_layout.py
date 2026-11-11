@@ -249,8 +249,13 @@ def test_no_source_file_is_hidden_by_a_gitignore_rule():
 
 
 def test_the_runtime_layer_is_visible_to_git():
-    """The positive half: the layer the rules once swallowed must be addable."""
-    visible = _git_files("--others")
+    """The positive half: the layer the rules once swallowed must be addable.
+
+    ``--cached --others`` on purpose: before the first commit these files are untracked-but-stageable,
+    afterwards they are tracked.  Both mean "git sees this path", which is the invariant; ``--others``
+    alone silently stopped testing anything the moment the tree was committed.
+    """
+    visible = _git_files("--cached", "--others")
     assert "src/ascend_platform/runtime/step.py" in visible
     assert "src/ascend_platform/runtime/__init__.py" in visible
 
